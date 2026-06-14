@@ -13,8 +13,9 @@ class BDSK_Settings_Page {
 		add_action( 'admin_init',    [ __CLASS__, 'register_settings' ] );
 		add_action( 'admin_init',    [ __CLASS__, 'maybe_redirect_after_activation' ] );
 		add_action( 'admin_notices', [ __CLASS__, 'maybe_show_notice' ] );
-		add_action( 'admin_post_bdsk_generate_key',    [ __CLASS__, 'handle_generate_key' ] );
-		add_action( 'admin_post_bdsk_emergency_cleanup', [ __CLASS__, 'handle_emergency_cleanup' ] );
+		add_action( 'admin_post_bdsk_generate_key',       [ __CLASS__, 'handle_generate_key' ] );
+		add_action( 'admin_post_bdsk_emergency_cleanup',  [ __CLASS__, 'handle_emergency_cleanup' ] );
+		add_action( 'admin_post_bdsk_rebuild_media_index', [ __CLASS__, 'handle_rebuild_media_index' ] );
 	}
 
 	// ---------------------------------------------------------------------------
@@ -61,16 +62,21 @@ class BDSK_Settings_Page {
 
 		add_settings_section( 'bdsk_main',     'Connection Settings', '__return_false', self::PAGE_SLUG );
 		add_settings_section( 'bdsk_security', 'Security',            '__return_false', self::PAGE_SLUG );
+		add_settings_section( 'bdsk_media',    'Media Manifest',      '__return_false', self::PAGE_SLUG );
 		add_settings_section( 'bdsk_debug',    'Development',         '__return_false', self::PAGE_SLUG );
 
 		$fields = [
 			// [ id, label, section, type, description ]
-			[ 'enabled',               'Connector Enabled',           'bdsk_main',     'checkbox', 'Master on/off switch for the entire connector.' ],
-			[ 'read_access_enabled',   'Read Access Enabled',         'bdsk_main',     'checkbox', 'Allow Server 2 to call read endpoints.' ],
-			[ 'backup_export_enabled', 'Backup Export Enabled',       'bdsk_main',     'checkbox', 'Allow Server 2 to start DB export jobs.' ],
-			[ 'allowed_ips',           'Allowed Server IPs',          'bdsk_security', 'text',     'Comma-separated IPs that may connect (e.g. 1.2.3.4, 5.6.7.8).' ],
-			[ 'disable_ip_check',      'Disable IP Check (dev only)', 'bdsk_security', 'checkbox', 'WARNING: disables IP allow-list. Never enable in production.' ],
-			[ 'debug_log_enabled',     'Enable Debug Log',            'bdsk_debug',    'checkbox', 'Writes to <code>wp-content/bdsk-debug.log</code>. Never enable in production.' ],
+			[ 'enabled',                 'Connector Enabled',              'bdsk_main',     'checkbox', 'Master on/off switch for the entire connector.' ],
+			[ 'read_access_enabled',     'Read Access Enabled',            'bdsk_main',     'checkbox', 'Allow Server 2 to call read endpoints.' ],
+			[ 'backup_export_enabled',   'Backup Export Enabled',          'bdsk_main',     'checkbox', 'Allow Server 2 to start DB export jobs.' ],
+			[ 'allowed_ips',             'Allowed Server IPs',             'bdsk_security', 'text',     'Comma-separated IPs that may connect (e.g. 1.2.3.4, 5.6.7.8).' ],
+			[ 'disable_ip_check',        'Disable IP Check (dev only)',    'bdsk_security', 'checkbox', 'WARNING: disables IP allow-list. Never enable in production.' ],
+			[ 'media_manifest_enabled',  'Media Manifest Enabled',         'bdsk_media',    'checkbox', 'Expose the <code>/media-manifest</code> endpoint to Server 2.' ],
+			[ 'include_evidence_images', 'Include Evidence Images',        'bdsk_media',    'checkbox', 'Index order evidence/receipt images. WARNING: may contain personal financial data — protect Server 2 storage accordingly.' ],
+			[ 'index_unknown_media',     'Index Unknown Media',            'bdsk_media',    'checkbox', 'Index attachments not linked to any product or order. Default OFF (avoids theme/logo clutter).' ],
+			[ 'evidence_meta_keys',      'Evidence Image Meta Keys',       'bdsk_media',    'text',     'Comma-separated order meta keys that hold WP attachment IDs for evidence images. Leave empty if not used.' ],
+			[ 'debug_log_enabled',       'Enable Debug Log',               'bdsk_debug',    'checkbox', 'Writes to <code>wp-content/bdsk-debug.log</code>. Never enable in production.' ],
 		];
 
 		foreach ( $fields as [ $id, $label, $section, $type, $desc ] ) {
@@ -123,12 +129,16 @@ class BDSK_Settings_Page {
 		$existing = BDSK_Settings::all();
 
 		return [
-			'enabled'               => ! empty( $input['enabled'] ),
-			'read_access_enabled'   => ! empty( $input['read_access_enabled'] ),
-			'backup_export_enabled' => ! empty( $input['backup_export_enabled'] ),
-			'allowed_ips'           => sanitize_text_field( $input['allowed_ips'] ?? '' ),
-			'disable_ip_check'      => ! empty( $input['disable_ip_check'] ),
-			'debug_log_enabled'     => ! empty( $input['debug_log_enabled'] ),
+			'enabled'                => ! empty( $input['enabled'] ),
+			'read_access_enabled'    => ! empty( $input['read_access_enabled'] ),
+			'backup_export_enabled'  => ! empty( $input['backup_export_enabled'] ),
+			'allowed_ips'            => sanitize_text_field( $input['allowed_ips'] ?? '' ),
+			'disable_ip_check'       => ! empty( $input['disable_ip_check'] ),
+			'media_manifest_enabled' => ! empty( $input['media_manifest_enabled'] ),
+			'include_evidence_images' => ! empty( $input['include_evidence_images'] ),
+			'index_unknown_media'    => ! empty( $input['index_unknown_media'] ),
+			'evidence_meta_keys'     => sanitize_text_field( $input['evidence_meta_keys'] ?? '' ),
+			'debug_log_enabled'      => ! empty( $input['debug_log_enabled'] ),
 			// Legacy hash preserved — not written by the new generate flow
 			'api_key_hash'            => $existing['api_key_hash'],
 			// Preserve stats fields
@@ -161,6 +171,23 @@ class BDSK_Settings_Page {
 		}
 
 		wp_safe_redirect( admin_url( 'options-general.php?page=' . self::PAGE_SLUG ) );
+		exit;
+	}
+
+	// ---------------------------------------------------------------------------
+	// Rebuild media index handler
+	// ---------------------------------------------------------------------------
+
+	public static function handle_rebuild_media_index(): void {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Unauthorised.' );
+		}
+		check_admin_referer( 'bdsk_rebuild_media_index' );
+
+		$result = BDSK_Media_Index::schedule_full_build();
+		$notice = is_wp_error( $result ) ? 'media_rebuild_error' : 'media_rebuild_started';
+
+		wp_safe_redirect( admin_url( 'options-general.php?page=' . self::PAGE_SLUG . '&bdsk_notice=' . $notice ) );
 		exit;
 	}
 
@@ -225,8 +252,17 @@ class BDSK_Settings_Page {
 		}
 
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-		if ( isset( $_GET['bdsk_notice'] ) && 'cleanup_done' === $_GET['bdsk_notice'] ) {
-			echo '<div class="notice notice-success is-dismissible"><p><strong>Behdashtik Mirror Connector:</strong> Emergency cleanup completed.</p></div>';
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		switch ( $_GET['bdsk_notice'] ?? '' ) {
+			case 'cleanup_done':
+				echo '<div class="notice notice-success is-dismissible"><p><strong>Behdashtik Mirror Connector:</strong> Emergency cleanup completed.</p></div>';
+				break;
+			case 'media_rebuild_started':
+				echo '<div class="notice notice-success is-dismissible"><p><strong>Behdashtik Mirror Connector:</strong> Media index rebuild started in the background.</p></div>';
+				break;
+			case 'media_rebuild_error':
+				echo '<div class="notice notice-error is-dismissible"><p><strong>Behdashtik Mirror Connector:</strong> Could not start media index rebuild (already running or Action Scheduler unavailable).</p></div>';
+				break;
 		}
 	}
 
@@ -380,6 +416,45 @@ class BDSK_Settings_Page {
 					<td><?php echo esc_html( $settings['last_export_downloaded'] ?: '—' ); ?></td>
 				</tr>
 			</table>
+
+			<hr />
+
+			<h2>Media Index</h2>
+
+			<?php
+			$media_status = BDSK_Media_Index::get_status();
+			$ms_label     = match( $media_status['status'] ) {
+				'running' => '<span style="color:orange">Running — step: ' . esc_html( $media_status['current_step'] ) . ', offset: ' . (int) $media_status['current_offset'] . '</span>',
+				'idle'    => '<span style="color:green">Idle</span>',
+				default   => esc_html( $media_status['status'] ),
+			};
+			?>
+			<table class="form-table widefat" style="width:auto">
+				<tr>
+					<th>Index Status</th>
+					<td><?php echo wp_kses( $ms_label, [ 'span' => [ 'style' => [] ] ] ); ?></td>
+				</tr>
+				<tr>
+					<th>Last Full Build</th>
+					<td><?php echo esc_html( $media_status['last_full_build_at'] ?: '—' ); ?></td>
+				</tr>
+				<?php if ( $media_status['last_error'] ) : ?>
+				<tr>
+					<th>Last Error</th>
+					<td style="color:#d63638"><?php echo esc_html( $media_status['last_error'] ); ?></td>
+				</tr>
+				<?php endif; ?>
+			</table>
+
+			<?php if ( 'running' !== $media_status['status'] ) : ?>
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="margin-top:12px">
+				<input type="hidden" name="action" value="bdsk_rebuild_media_index" />
+				<?php wp_nonce_field( 'bdsk_rebuild_media_index' ); ?>
+				<?php submit_button( 'Rebuild Media Index Now', 'secondary', 'bdsk_rebuild_media', false ); ?>
+			</form>
+			<?php else : ?>
+			<p style="margin-top:12px"><em>Build in progress — refresh to check status.</em></p>
+			<?php endif; ?>
 
 			<hr />
 

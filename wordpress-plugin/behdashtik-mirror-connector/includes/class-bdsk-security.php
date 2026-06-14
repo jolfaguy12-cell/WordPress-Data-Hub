@@ -19,6 +19,10 @@ class BDSK_Settings {
 		'disable_ip_check'       => false,
 		'api_key_hash'           => '',   // legacy: hash-only fallback (no longer written by new UI)
 		'debug_log_enabled'      => false,
+		'media_manifest_enabled' => true,
+		'index_unknown_media'    => false,
+		'include_evidence_images' => true,
+		'evidence_meta_keys'     => '',
 		'last_successful_request' => '',
 		'last_failed_request'    => '',
 		'last_export_downloaded' => '',

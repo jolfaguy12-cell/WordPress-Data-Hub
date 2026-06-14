@@ -3,7 +3,7 @@
  * Plugin Name:       Behdashtik Mirror Connector
  * Plugin URI:        https://github.com/jolfaguy12-cell/WordPress-Data-Hub
  * Description:       Secure database export pipeline for the Behdashtik WordPress mirror system.
- * Version:           1.1.0
+ * Version:           1.2.0
  * Requires at least: 7.0
  * Requires PHP:      8.1
  * Author:            Behdashtik
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'BDSK_VERSION',            '1.1.0' );
+define( 'BDSK_VERSION',            '1.2.0' );
 define( 'BDSK_PLUGIN_DIR',         plugin_dir_path( __FILE__ ) );
 define( 'BDSK_PLUGIN_URL',         plugin_dir_url( __FILE__ ) );
 define( 'BDSK_EXPORT_CHUNK_SIZE',  500 );          // rows per batch (filterable)
@@ -32,6 +32,8 @@ foreach ( [
 	'includes/class-bdsk-export-job.php',
 	'includes/class-bdsk-export-rest.php',
 	'includes/class-bdsk-cleanup.php',
+	'includes/class-bdsk-media-index.php',
+	'includes/class-bdsk-media-rest.php',
 	'admin/class-bdsk-settings-page.php',
 ] as $file ) {
 	require_once BDSK_PLUGIN_DIR . $file;
@@ -90,8 +92,10 @@ register_deactivation_hook( __FILE__, static function () {
 add_action( 'plugins_loaded', static function () {
 	// Register REST routes, AS hook handlers, and admin UI — safe at plugins_loaded.
 	BDSK_Export_Rest::init();
+	BDSK_Media_Rest::init();
 	BDSK_Cleanup::init();
 	BDSK_Export_Job::init_scheduler();
+	BDSK_Media_Index::init();
 
 	if ( is_admin() ) {
 		BDSK_Settings_Page::init();

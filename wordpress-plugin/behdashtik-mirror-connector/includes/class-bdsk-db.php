@@ -19,6 +19,11 @@ class BDSK_DB {
 		return $wpdb->prefix . 'bdsk_request_log';
 	}
 
+	public static function media_index_table(): string {
+		global $wpdb;
+		return $wpdb->prefix . 'bdsk_media_index';
+	}
+
 	// ---------------------------------------------------------------------------
 	// Activation: create custom tables
 	// ---------------------------------------------------------------------------
@@ -71,8 +76,32 @@ class BDSK_DB {
 			KEY status (status)
 		) $charset;";
 
+		$media_sql = "CREATE TABLE " . self::media_index_table() . " (
+			id                     BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+			attachment_id          BIGINT UNSIGNED NOT NULL,
+			product_id             BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			order_id               BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			image_type             VARCHAR(20)     NOT NULL DEFAULT '',
+			original_url           TEXT            NOT NULL,
+			alt_text               TEXT,
+			title                  TEXT,
+			caption                TEXT,
+			width                  INT             DEFAULT NULL,
+			height                 INT             DEFAULT NULL,
+			mime_type              VARCHAR(100)    DEFAULT NULL,
+			file_size              BIGINT          DEFAULT NULL,
+			attachment_modified_at DATETIME        NOT NULL DEFAULT '1970-01-01 00:00:00',
+			index_updated_at       DATETIME        NOT NULL DEFAULT '1970-01-01 00:00:00',
+			status                 VARCHAR(10)     NOT NULL DEFAULT 'active',
+			PRIMARY KEY  (id),
+			UNIQUE KEY att_product_order_type (attachment_id, product_id, order_id, image_type),
+			KEY index_updated_at (index_updated_at),
+			KEY status (status)
+		) $charset;";
+
 		dbDelta( $jobs_sql );
 		dbDelta( $log_sql );
+		dbDelta( $media_sql );
 	}
 
 	// ---------------------------------------------------------------------------

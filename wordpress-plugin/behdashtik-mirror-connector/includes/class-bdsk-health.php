@@ -27,26 +27,31 @@ class BDSK_Health {
 
 		$settings = BDSK_Settings::all();
 
+		$media_status = BDSK_Media_Index::get_status();
+
 		return [
-			'status'                  => 'ok',
-			'site_url'                => get_site_url(),
-			'plugin_version'          => BDSK_VERSION,
-			'wordpress_version'       => get_bloginfo( 'version' ),
-			'woocommerce_active'      => $wc_active,
-			'woocommerce_version'     => $wc_version,
-			'php_version'             => PHP_VERSION,
+			'status'                   => 'ok',
+			'site_url'                 => get_site_url(),
+			'plugin_version'           => BDSK_VERSION,
+			'wordpress_version'        => get_bloginfo( 'version' ),
+			'woocommerce_active'       => $wc_active,
+			'woocommerce_version'      => $wc_version,
+			'php_version'              => PHP_VERSION,
 			'mysql_or_mariadb_version' => $db_version,
-			'gzip_or_zlib_available'  => $gzip_available,
-			'openssl_available'       => $openssl_available,
-			'memory_limit'            => $memory_limit,
-			'max_execution_time'      => $max_exec_time,
-			'server_time'             => gmdate( 'c' ),
-			'db_prefix'               => $wpdb->prefix,
-			'connector_enabled'       => (bool) $settings['enabled'],
-			'read_mode_status'        => $settings['read_access_enabled'] ? 'on' : 'off',
-			'write_mode_status'       => 'off', // Phase 1: always off
-			'backup_export_enabled'   => (bool) $settings['backup_export_enabled'],
-			'last_successful_request' => $settings['last_successful_request'] ?: null,
+			'gzip_or_zlib_available'   => $gzip_available,
+			'openssl_available'        => $openssl_available,
+			'memory_limit'             => $memory_limit,
+			'max_execution_time'       => $max_exec_time,
+			'server_time'              => gmdate( 'c' ),
+			'db_prefix'                => $wpdb->prefix,
+			'connector_enabled'        => (bool) $settings['enabled'],
+			'read_mode_status'         => $settings['read_access_enabled'] ? 'on' : 'off',
+			'write_mode_status'        => 'off',
+			'backup_export_enabled'    => (bool) $settings['backup_export_enabled'],
+			'media_manifest_enabled'   => (bool) BDSK_Settings::get( 'media_manifest_enabled', true ),
+			'media_index_status'       => null === $media_status['last_full_build_at'] ? 'never_built' : $media_status['status'],
+			'media_index_last_built_at' => $media_status['last_full_build_at'],
+			'last_successful_request'  => $settings['last_successful_request'] ?: null,
 		];
 	}
 }

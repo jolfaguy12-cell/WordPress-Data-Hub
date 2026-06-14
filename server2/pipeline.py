@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import gzip
 import hashlib
 import json
@@ -560,15 +561,395 @@ def import_only(cfg: dict, job_dir_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Media Sync — local index table setup
+# ---------------------------------------------------------------------------
+
+MEDIA_SYNC_STATE_PATH = pathlib.Path(__file__).parent / "media_sync_state.json"
+
+MEDIA_LOCAL_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS bdsk_local_media_index (
+    id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    manifest_id      BIGINT UNSIGNED NOT NULL,
+    attachment_id    BIGINT UNSIGNED NOT NULL,
+    product_id       BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    order_id         BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    image_type       VARCHAR(20)     NOT NULL DEFAULT '',
+    original_url     TEXT            NOT NULL,
+    alt_text         TEXT,
+    title            TEXT,
+    caption          TEXT,
+    width            INT             DEFAULT NULL,
+    height           INT             DEFAULT NULL,
+    mime_type        VARCHAR(100)    DEFAULT NULL,
+    file_size        BIGINT          DEFAULT NULL,
+    modified_at      VARCHAR(30)     DEFAULT NULL,
+    manifest_status  VARCHAR(10)     NOT NULL DEFAULT 'active',
+    local_path       TEXT            DEFAULT NULL,
+    local_file_size  BIGINT          DEFAULT NULL,
+    download_status  VARCHAR(10)     NOT NULL DEFAULT 'pending',
+    downloaded_at    DATETIME        DEFAULT NULL,
+    last_checked_at  DATETIME        DEFAULT NULL,
+    retry_count      INT             NOT NULL DEFAULT 0,
+    PRIMARY KEY      (id),
+    UNIQUE KEY       manifest_id (manifest_id),
+    KEY              download_status (download_status),
+    KEY              attachment_id (attachment_id)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+"""
+
+
+def _media_conn(cfg: dict):
+    db = cfg["mirror_db"]
+    return pymysql.connect(
+        host=db["host"],
+        port=db.get("port", 3306),
+        user=db["user"],
+        password=db["password"],
+        database=db["name"],
+        charset="utf8mb4",
+        autocommit=True,
+    )
+
+
+def setup_media_local_table(cfg: dict) -> None:
+    with _media_conn(cfg) as conn:
+        with conn.cursor() as cur:
+            cur.execute(MEDIA_LOCAL_TABLE_SQL)
+
+
+# ---------------------------------------------------------------------------
+# Media Sync — manifest fetching
+# ---------------------------------------------------------------------------
+
+def _fetch_manifest_page(cfg: dict, after_id: int, limit: int,
+                          modified_since: int | None, include_deleted: bool) -> dict:
+    params: dict = {"after_id": after_id, "limit": limit}
+    if modified_since:
+        params["modified_since"] = modified_since
+    if not include_deleted:
+        params["include_deleted"] = "false"
+    return api_get(cfg, "/media-manifest", params=params)
+
+
+def _upsert_local_media(cur, item: dict) -> None:
+    cur.execute(
+        """
+        INSERT INTO bdsk_local_media_index
+          (manifest_id, attachment_id, product_id, order_id, image_type,
+           original_url, alt_text, title, caption, width, height, mime_type,
+           file_size, modified_at, manifest_status, last_checked_at)
+        VALUES
+          (%s, %s, %s, %s, %s,
+           %s, %s, %s, %s, %s, %s, %s,
+           %s, %s, %s, NOW())
+        ON DUPLICATE KEY UPDATE
+          attachment_id   = VALUES(attachment_id),
+          product_id      = VALUES(product_id),
+          order_id        = VALUES(order_id),
+          image_type      = VALUES(image_type),
+          original_url    = VALUES(original_url),
+          alt_text        = VALUES(alt_text),
+          title           = VALUES(title),
+          caption         = VALUES(caption),
+          width           = VALUES(width),
+          height          = VALUES(height),
+          mime_type       = VALUES(mime_type),
+          file_size       = VALUES(file_size),
+          modified_at     = VALUES(modified_at),
+          manifest_status = VALUES(manifest_status),
+          last_checked_at = NOW()
+        """,
+        (
+            item["id"],
+            item["attachment_id"],
+            item.get("product_id") or 0,
+            item.get("order_id") or 0,
+            item["image_type"],
+            item["original_url"],
+            item.get("alt_text"),
+            item.get("title"),
+            item.get("caption"),
+            item.get("width"),
+            item.get("height"),
+            item.get("mime_type"),
+            item.get("file_size"),
+            item.get("modified_at"),
+            item.get("status", "active"),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Media Sync — file download
+# ---------------------------------------------------------------------------
+
+def _local_path_for(media_base: pathlib.Path, item: dict) -> pathlib.Path:
+    url = item["original_url"]
+    marker = "/wp-content/uploads/"
+    idx = url.find(marker)
+    if idx != -1:
+        rel = url[idx + len(marker):]
+        # Sanitise: strip query string / fragment
+        rel = rel.split("?")[0].split("#")[0]
+        return media_base / rel
+    # Fallback: flat directory named by attachment_id
+    basename = url.split("/")[-1].split("?")[0] or "unknown"
+    return media_base / "_unmatched" / f"{item['attachment_id']}_{basename}"
+
+
+def _download_one(cfg: dict, item: dict, media_base: pathlib.Path,
+                  max_file_size: int) -> tuple[str, str | None]:
+    """Returns (manifest_id_str, error_message_or_None)."""
+    manifest_id = str(item["id"])
+    url         = item["original_url"]
+    dest        = _local_path_for(media_base, item)
+    expected_size = item.get("file_size")
+
+    # Skip files above max_file_size
+    if expected_size and expected_size > max_file_size:
+        return manifest_id, f"skipped: file_size {expected_size} > max {max_file_size}"
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_suffix(dest.suffix + ".part")
+
+    for attempt in range(3):
+        try:
+            with requests.get(
+                url,
+                headers={"Authorization": f"Bearer {cfg['api_secret']}"},
+                stream=True,
+                timeout=(10, 120),  # connect, read
+            ) as r:
+                if not r.ok:
+                    raise RuntimeError(f"HTTP {r.status_code}")
+                with part.open("wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        f.write(chunk)
+
+            actual = part.stat().st_size
+            if expected_size and actual != expected_size:
+                part.unlink(missing_ok=True)
+                raise RuntimeError(f"size mismatch: got {actual}, expected {expected_size}")
+
+            part.rename(dest)
+            return manifest_id, None
+
+        except Exception as exc:
+            if attempt == 2:
+                part.unlink(missing_ok=True)
+                return manifest_id, str(exc)
+            time.sleep(2 ** attempt)
+
+    return manifest_id, "max retries exceeded"
+
+
+# ---------------------------------------------------------------------------
+# Media Sync — load / save sync state
+# ---------------------------------------------------------------------------
+
+def _load_sync_state() -> dict:
+    if MEDIA_SYNC_STATE_PATH.exists():
+        try:
+            return json.loads(MEDIA_SYNC_STATE_PATH.read_text())
+        except Exception:
+            pass
+    return {"last_sync_at": None}
+
+
+def _save_sync_state(state: dict) -> None:
+    MEDIA_SYNC_STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Media Sync — main entry point
+# ---------------------------------------------------------------------------
+
+def run_media_sync(cfg: dict, full: bool = False) -> None:
+    media_cfg     = cfg.get("media_sync", {})
+    if not media_cfg.get("enabled", True):
+        print("[media] Media sync disabled in config.")
+        return
+
+    media_base    = pathlib.Path(media_cfg.get("storage_path", "/tmp/bdsk-media"))
+    concurrency   = int(media_cfg.get("concurrency", 4))
+    max_file_size = int(media_cfg.get("max_file_size_bytes", 52_428_800))  # 50 MB
+    page_limit    = 200
+
+    media_base.mkdir(parents=True, exist_ok=True)
+
+    # Protect the directory (deny web access)
+    htaccess = media_base / ".htaccess"
+    if not htaccess.exists():
+        htaccess.write_text("Deny from all\n")
+
+    # Ensure local index table exists
+    setup_media_local_table(cfg)
+
+    state = _load_sync_state()
+    sync_start = int(time.time())
+
+    if full or not state.get("last_sync_at"):
+        modified_since = None
+        print("[media] Starting full media manifest sync …")
+    else:
+        # 5-minute safety margin for clock skew
+        modified_since = max(0, int(state["last_sync_at"]) - 300)
+        ts_str = datetime.fromtimestamp(modified_since, tz=timezone.utc).isoformat()
+        print(f"[media] Incremental sync since {ts_str} …")
+
+    # ---- Phase 1: page through manifest and upsert into local index ----
+    after_id     = 0
+    total_items  = 0
+
+    with _media_conn(cfg) as conn:
+        with conn.cursor() as cur:
+            while True:
+                page = _fetch_manifest_page(
+                    cfg, after_id, page_limit, modified_since, include_deleted=True
+                )
+                items = page.get("items", [])
+                if not items:
+                    break
+
+                for item in items:
+                    _upsert_local_media(cur, item)
+
+                total_items += len(items)
+                after_id = page.get("next_after_id") or 0
+                print(f"[media] Fetched {total_items} manifest entries …", end="\r")
+
+                if not page.get("has_more"):
+                    break
+
+    print(f"\n[media] Manifest sync complete: {total_items} entries processed.")
+
+    # ---- Phase 2: handle deletions ----
+    with _media_conn(cfg) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT local_path FROM bdsk_local_media_index
+                WHERE manifest_status = 'deleted' AND download_status != 'deleted'
+                """
+            )
+            for (local_path,) in cur.fetchall():
+                if local_path:
+                    p = pathlib.Path(local_path)
+                    if p.exists():
+                        p.unlink()
+                        print(f"[media] Deleted: {p}")
+            cur.execute(
+                """
+                UPDATE bdsk_local_media_index
+                SET download_status = 'deleted'
+                WHERE manifest_status = 'deleted' AND download_status != 'deleted'
+                """
+            )
+
+    # ---- Phase 3: determine download queue ----
+    with _media_conn(cfg) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT manifest_id, attachment_id, image_type, original_url,
+                       file_size, modified_at, local_path, local_file_size,
+                       downloaded_at
+                FROM bdsk_local_media_index
+                WHERE manifest_status = 'active'
+                AND download_status NOT IN ('deleted', 'skipped')
+                """
+            )
+            rows = cur.fetchall()
+
+    download_queue = []
+    for (mid, att_id, itype, url, file_size, mod_at, local_path, local_file_size, downloaded_at) in rows:
+        if not local_path:
+            # Never downloaded
+            download_queue.append({"id": mid, "attachment_id": att_id, "image_type": itype,
+                                   "original_url": url, "file_size": file_size, "modified_at": mod_at})
+            continue
+        dest = pathlib.Path(local_path)
+        if not dest.exists():
+            download_queue.append({"id": mid, "attachment_id": att_id, "image_type": itype,
+                                   "original_url": url, "file_size": file_size, "modified_at": mod_at})
+            continue
+        if file_size and local_file_size != file_size:
+            download_queue.append({"id": mid, "attachment_id": att_id, "image_type": itype,
+                                   "original_url": url, "file_size": file_size, "modified_at": mod_at})
+            continue
+        if mod_at and downloaded_at and mod_at > downloaded_at.isoformat() if hasattr(downloaded_at, 'isoformat') else False:
+            download_queue.append({"id": mid, "attachment_id": att_id, "image_type": itype,
+                                   "original_url": url, "file_size": file_size, "modified_at": mod_at})
+
+    print(f"[media] {len(download_queue)} files to download.")
+
+    if not download_queue:
+        _save_sync_state({"last_sync_at": sync_start})
+        print("[media] Media sync complete (nothing to download).")
+        return
+
+    # ---- Phase 4: concurrent downloads ----
+    done = 0
+    errors = 0
+
+    def _do_download(item):
+        return _download_one(cfg, item, media_base, max_file_size)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {pool.submit(_do_download, item): item for item in download_queue}
+        for future in concurrent.futures.as_completed(futures):
+            item = futures[future]
+            manifest_id, error = future.result()
+            dest = _local_path_for(media_base, item)
+
+            with _media_conn(cfg) as conn:
+                with conn.cursor() as cur:
+                    if error:
+                        errors += 1
+                        cur.execute(
+                            """
+                            UPDATE bdsk_local_media_index
+                            SET download_status = 'failed', retry_count = retry_count + 1,
+                                last_checked_at = NOW()
+                            WHERE manifest_id = %s
+                            """,
+                            (manifest_id,),
+                        )
+                        print(f"[media] FAIL  attachment={item['attachment_id']} — {error}")
+                    else:
+                        done += 1
+                        file_size = dest.stat().st_size if dest.exists() else None
+                        cur.execute(
+                            """
+                            UPDATE bdsk_local_media_index
+                            SET download_status = 'downloaded',
+                                local_path = %s,
+                                local_file_size = %s,
+                                downloaded_at = NOW(),
+                                last_checked_at = NOW(),
+                                retry_count = 0
+                            WHERE manifest_id = %s
+                            """,
+                            (str(dest), file_size, manifest_id),
+                        )
+
+    print(f"[media] Downloads complete: {done} OK, {errors} failed.")
+    _save_sync_state({"last_sync_at": sync_start})
+    print("[media] Media sync state saved.")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Behdashtik Mirror Connector pipeline")
-    parser.add_argument("--health-only",  action="store_true", help="Only run health check")
-    parser.add_argument("--test",         action="store_true", help="Use test export (50 rows per table)")
-    parser.add_argument("--import-only",  metavar="JOB_DIR",   help="Re-import an already-downloaded archive")
-    parser.add_argument("--prune",        action="store_true", help="Prune expired local archives and exit")
+    parser.add_argument("--health-only",     action="store_true", help="Only run health check")
+    parser.add_argument("--test",            action="store_true", help="Use test export (50 rows per table)")
+    parser.add_argument("--import-only",     metavar="JOB_DIR",   help="Re-import an already-downloaded archive")
+    parser.add_argument("--prune",           action="store_true", help="Prune expired local archives and exit")
+    parser.add_argument("--media-sync",      action="store_true", help="Run incremental media file sync")
+    parser.add_argument("--media-sync-full", action="store_true", help="Run full media file sync (ignores last_sync_at)")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -580,6 +961,10 @@ if __name__ == "__main__":
             health_check(cfg)
         elif args.import_only:
             import_only(cfg, args.import_only)
+        elif args.media_sync_full:
+            run_media_sync(cfg, full=True)
+        elif args.media_sync:
+            run_media_sync(cfg, full=False)
         else:
             run_pipeline(cfg, test_mode=args.test)
     except (RuntimeError, TimeoutError, FileNotFoundError) as exc:

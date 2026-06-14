@@ -29,6 +29,9 @@ class BDSK_Cleanup {
 		foreach ( $jobs as $job ) {
 			self::cleanup_job( $job['job_id'] );
 		}
+
+		// Prune soft-deleted media index rows older than 30 days
+		BDSK_Media_Index::prune_old_deleted_rows();
 	}
 
 	/**
