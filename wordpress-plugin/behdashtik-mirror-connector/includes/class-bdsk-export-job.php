@@ -461,8 +461,12 @@ class BDSK_Export_Job {
 			return 'NULL';
 		}
 		global $wpdb;
-		// _real_escape uses mysqli_real_escape_string against the live connection
-		return "'" . $wpdb->_real_escape( (string) $value ) . "'";
+		// WordPress 7.0 changed _real_escape() to replace '%' with an internal
+		// hash placeholder (to protect LIKE wildcards), which corrupts SQL values
+		// that legitimately contain '%' (e.g. URL-encoded slugs).
+		// mysqli_real_escape_string() escapes only actual MySQL string-literal
+		// special chars (\0 \n \r \ ' " \Z) and never touches '%'.
+		return "'" . mysqli_real_escape_string( $wpdb->dbh, (string) $value ) . "'";
 	}
 
 	// ---------------------------------------------------------------------------
