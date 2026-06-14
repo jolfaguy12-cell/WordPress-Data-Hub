@@ -18,6 +18,9 @@ class BDSK_Health {
 		// gzip / zlib availability
 		$gzip_available = function_exists( 'gzopen' ) && function_exists( 'gzencode' );
 
+		// OpenSSL availability (required for encrypted-at-rest API key storage)
+		$openssl_available = extension_loaded( 'openssl' );
+
 		// PHP memory limit and max_execution_time
 		$memory_limit   = ini_get( 'memory_limit' );
 		$max_exec_time  = (int) ini_get( 'max_execution_time' );
@@ -34,6 +37,7 @@ class BDSK_Health {
 			'php_version'             => PHP_VERSION,
 			'mysql_or_mariadb_version' => $db_version,
 			'gzip_or_zlib_available'  => $gzip_available,
+			'openssl_available'       => $openssl_available,
 			'memory_limit'            => $memory_limit,
 			'max_execution_time'      => $max_exec_time,
 			'server_time'             => gmdate( 'c' ),

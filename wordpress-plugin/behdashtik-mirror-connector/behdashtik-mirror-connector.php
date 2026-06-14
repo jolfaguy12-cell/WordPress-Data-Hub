@@ -3,9 +3,9 @@
  * Plugin Name:       Behdashtik Mirror Connector
  * Plugin URI:        https://github.com/jolfaguy12-cell/WordPress-Data-Hub
  * Description:       Secure database export pipeline for the Behdashtik WordPress mirror system.
- * Version:           1.0.0
- * Requires at least: 6.0
- * Requires PHP:      8.0
+ * Version:           1.1.0
+ * Requires at least: 7.0
+ * Requires PHP:      8.1
  * Author:            Behdashtik
  * License:           GPL-2.0-or-later
  * Text Domain:       bdsk
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'BDSK_VERSION',            '1.0.0' );
+define( 'BDSK_VERSION',            '1.1.0' );
 define( 'BDSK_PLUGIN_DIR',         plugin_dir_path( __FILE__ ) );
 define( 'BDSK_PLUGIN_URL',         plugin_dir_url( __FILE__ ) );
 define( 'BDSK_EXPORT_CHUNK_SIZE',  500 );          // rows per batch (filterable)
@@ -69,6 +69,14 @@ function bdsk_base64url_decode( string $data ): string {
 
 register_activation_hook( __FILE__, static function () {
 	BDSK_DB::create_tables();
+
+	// On first activation with no secret configured: generate one and redirect
+	// the admin to the settings page where it will be displayed once.
+	if ( extension_loaded( 'openssl' ) && ! BDSK_Security::has_secret() ) {
+		$plaintext = BDSK_Security::generate_and_store();
+		set_transient( 'bdsk_flash_new_key', $plaintext, 300 );
+		set_transient( 'bdsk_activation_redirect', true, 30 );
+	}
 	// Scheduling is handled by the `init` hook on first load after activation.
 } );
 

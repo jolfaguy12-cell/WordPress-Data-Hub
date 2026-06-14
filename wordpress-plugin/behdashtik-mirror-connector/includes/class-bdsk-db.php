@@ -181,6 +181,23 @@ class BDSK_DB {
 	}
 
 	// ---------------------------------------------------------------------------
+	// Download token helpers
+	// ---------------------------------------------------------------------------
+
+	/**
+	 * Invalidates all active download tokens immediately.
+	 * Called when the API secret is regenerated so in-flight tokens stop working.
+	 */
+	public static function invalidate_all_download_tokens(): void {
+		global $wpdb;
+		$wpdb->query(
+			"UPDATE " . self::jobs_table() . "
+			 SET download_token_hash = NULL, download_token_expires_at = NULL
+			 WHERE status IN ('ready','downloading')"
+		);
+	}
+
+	// ---------------------------------------------------------------------------
 	// Request log
 	// ---------------------------------------------------------------------------
 

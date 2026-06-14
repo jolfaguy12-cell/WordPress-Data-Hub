@@ -11,7 +11,25 @@ class BDSK_Settings_Page {
 	public static function init(): void {
 		add_action( 'admin_menu',    [ __CLASS__, 'add_menu' ] );
 		add_action( 'admin_init',    [ __CLASS__, 'register_settings' ] );
+		add_action( 'admin_init',    [ __CLASS__, 'maybe_redirect_after_activation' ] );
 		add_action( 'admin_notices', [ __CLASS__, 'maybe_show_notice' ] );
+		add_action( 'admin_post_bdsk_generate_key',    [ __CLASS__, 'handle_generate_key' ] );
+		add_action( 'admin_post_bdsk_emergency_cleanup', [ __CLASS__, 'handle_emergency_cleanup' ] );
+	}
+
+	// ---------------------------------------------------------------------------
+	// Activation redirect
+	// ---------------------------------------------------------------------------
+
+	public static function maybe_redirect_after_activation(): void {
+		if ( ! get_transient( 'bdsk_activation_redirect' ) ) {
+			return;
+		}
+		delete_transient( 'bdsk_activation_redirect' );
+		if ( ! is_network_admin() && ! isset( $_GET['activate-multi'] ) ) {
+			wp_safe_redirect( admin_url( 'options-general.php?page=' . self::PAGE_SLUG ) );
+			exit;
+		}
 	}
 
 	// ---------------------------------------------------------------------------
@@ -41,36 +59,18 @@ class BDSK_Settings_Page {
 			]
 		);
 
-		add_settings_section(
-			'bdsk_main',
-			'Connection Settings',
-			'__return_false',
-			self::PAGE_SLUG
-		);
-
-		add_settings_section(
-			'bdsk_security',
-			'Security',
-			'__return_false',
-			self::PAGE_SLUG
-		);
-
-		add_settings_section(
-			'bdsk_debug',
-			'Development',
-			'__return_false',
-			self::PAGE_SLUG
-		);
+		add_settings_section( 'bdsk_main',     'Connection Settings', '__return_false', self::PAGE_SLUG );
+		add_settings_section( 'bdsk_security', 'Security',            '__return_false', self::PAGE_SLUG );
+		add_settings_section( 'bdsk_debug',    'Development',         '__return_false', self::PAGE_SLUG );
 
 		$fields = [
 			// [ id, label, section, type, description ]
-			[ 'enabled',               'Connector Enabled',             'bdsk_main',     'checkbox', 'Master on/off switch for the entire connector.' ],
-			[ 'read_access_enabled',   'Read Access Enabled',           'bdsk_main',     'checkbox', 'Allow Server 2 to call read endpoints.' ],
-			[ 'backup_export_enabled', 'Backup Export Enabled',         'bdsk_main',     'checkbox', 'Allow Server 2 to start DB export jobs.' ],
-			[ 'allowed_ips',           'Allowed Server IPs',            'bdsk_security', 'text',     'Comma-separated list of IPs that may connect (e.g. 1.2.3.4, 5.6.7.8).' ],
-			[ 'disable_ip_check',      'Disable IP Check (dev only)',   'bdsk_security', 'checkbox', 'WARNING: disables IP allow-list. Never enable this in production.' ],
-			[ 'api_key_hash',          'API Key (fallback)',            'bdsk_security', 'password', 'Used only when <code>BDSK_API_SECRET</code> is not defined in wp-config.php. Setting the constant is more secure.' ],
-			[ 'debug_log_enabled',     'Enable Debug Log',              'bdsk_debug',    'checkbox', 'Writes to <code>wp-content/bdsk-debug.log</code>. Never enable in production.' ],
+			[ 'enabled',               'Connector Enabled',           'bdsk_main',     'checkbox', 'Master on/off switch for the entire connector.' ],
+			[ 'read_access_enabled',   'Read Access Enabled',         'bdsk_main',     'checkbox', 'Allow Server 2 to call read endpoints.' ],
+			[ 'backup_export_enabled', 'Backup Export Enabled',       'bdsk_main',     'checkbox', 'Allow Server 2 to start DB export jobs.' ],
+			[ 'allowed_ips',           'Allowed Server IPs',          'bdsk_security', 'text',     'Comma-separated IPs that may connect (e.g. 1.2.3.4, 5.6.7.8).' ],
+			[ 'disable_ip_check',      'Disable IP Check (dev only)', 'bdsk_security', 'checkbox', 'WARNING: disables IP allow-list. Never enable in production.' ],
+			[ 'debug_log_enabled',     'Enable Debug Log',            'bdsk_debug',    'checkbox', 'Writes to <code>wp-content/bdsk-debug.log</code>. Never enable in production.' ],
 		];
 
 		foreach ( $fields as [ $id, $label, $section, $type, $desc ] ) {
@@ -100,21 +100,6 @@ class BDSK_Settings_Page {
 				checked( $value, true, false ),
 				wp_kses( $desc, [ 'code' => [] ] )
 			);
-		} elseif ( 'password' === $type ) {
-			// API key fallback — only show if constant not defined
-			if ( BDSK_Security::using_constant() ) {
-				echo '<p><em>API secret is set via the <code>BDSK_API_SECRET</code> constant in wp-config.php (recommended). The field below is ignored.</em></p>';
-			} else {
-				printf(
-					'<input type="password" name="%s[%s]" value="%s" class="regular-text" autocomplete="new-password" /><p class="description">%s</p>',
-					esc_attr( self::OPTION_KEY ),
-					esc_attr( $id ),
-					'', // never echo the hash back
-					wp_kses( $desc, [ 'code' => [] ] )
-				);
-				echo '<p class="description" style="color:#d63638"><strong>Recommendation:</strong> Define <code>BDSK_API_SECRET</code> in wp-config.php instead of using this field.</p>';
-			}
-			return;
 		} else {
 			printf(
 				'<input type="text" name="%s[%s]" value="%s" class="regular-text" />',
@@ -122,9 +107,6 @@ class BDSK_Settings_Page {
 				esc_attr( $id ),
 				esc_attr( (string) $value )
 			);
-		}
-
-		if ( $desc && 'checkbox' !== $type ) {
 			echo '<p class="description">' . wp_kses( $desc, [ 'code' => [] ] ) . '</p>';
 		}
 	}
@@ -140,27 +122,91 @@ class BDSK_Settings_Page {
 
 		$existing = BDSK_Settings::all();
 
-		$clean = [
+		return [
 			'enabled'               => ! empty( $input['enabled'] ),
 			'read_access_enabled'   => ! empty( $input['read_access_enabled'] ),
 			'backup_export_enabled' => ! empty( $input['backup_export_enabled'] ),
 			'allowed_ips'           => sanitize_text_field( $input['allowed_ips'] ?? '' ),
 			'disable_ip_check'      => ! empty( $input['disable_ip_check'] ),
 			'debug_log_enabled'     => ! empty( $input['debug_log_enabled'] ),
+			// Legacy hash preserved — not written by the new generate flow
+			'api_key_hash'            => $existing['api_key_hash'],
 			// Preserve stats fields
 			'last_successful_request' => $existing['last_successful_request'],
 			'last_failed_request'     => $existing['last_failed_request'],
 			'last_export_downloaded'  => $existing['last_export_downloaded'],
 		];
+	}
 
-		// API key fallback — only store hash, never plaintext
-		if ( ! BDSK_Security::using_constant() && ! empty( $input['api_key_hash'] ) ) {
-			$clean['api_key_hash'] = hash( 'sha256', $input['api_key_hash'] );
-		} else {
-			$clean['api_key_hash'] = $existing['api_key_hash'];
+	// ---------------------------------------------------------------------------
+	// Generate / Regenerate key handler
+	// ---------------------------------------------------------------------------
+
+	public static function handle_generate_key(): void {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Unauthorised.' );
+		}
+		check_admin_referer( 'bdsk_generate_key' );
+
+		$is_regen = BDSK_Security::has_secret() && ! BDSK_Security::using_constant();
+
+		$plaintext = BDSK_Security::generate_and_store();
+
+		// Store the plaintext for one-time display on the redirect target
+		set_transient( 'bdsk_flash_new_key', $plaintext, 300 );
+
+		// Invalidate any in-flight download tokens so they fail with the old key
+		if ( $is_regen ) {
+			BDSK_DB::invalidate_all_download_tokens();
 		}
 
-		return $clean;
+		wp_safe_redirect( admin_url( 'options-general.php?page=' . self::PAGE_SLUG ) );
+		exit;
+	}
+
+	// ---------------------------------------------------------------------------
+	// Emergency cleanup handler
+	// ---------------------------------------------------------------------------
+
+	public static function handle_emergency_cleanup(): void {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Unauthorised.' );
+		}
+		check_admin_referer( 'bdsk_emergency_cleanup' );
+
+		global $wpdb;
+
+		// Mark all active jobs as failed
+		$wpdb->query(
+			"UPDATE " . BDSK_DB::jobs_table() . "
+			 SET status = 'failed', last_error = 'Emergency cleanup by admin'
+			 WHERE status IN ('pending','running','ready','downloading')"
+		);
+
+		// Delete all export archive directories
+		$base = BDSK_Export_Job::get_export_base();
+		if ( is_dir( $base ) ) {
+			$dirs = glob( $base . '/*', GLOB_ONLYDIR );
+			if ( $dirs ) {
+				foreach ( $dirs as $dir ) {
+					// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+					array_map( 'unlink', glob( $dir . '/*' ) ?: [] );
+					@rmdir( $dir );
+				}
+			}
+		}
+
+		// Cancel all queued AS actions for this plugin
+		if ( function_exists( 'as_unschedule_all_actions' ) ) {
+			as_unschedule_all_actions( 'bdsk_export_chunk' );
+		}
+
+		bdsk_log( 'Emergency cleanup executed by admin.' );
+
+		wp_safe_redirect(
+			admin_url( 'options-general.php?page=' . self::PAGE_SLUG . '&bdsk_notice=cleanup_done' )
+		);
+		exit;
 	}
 
 	// ---------------------------------------------------------------------------
@@ -168,22 +214,16 @@ class BDSK_Settings_Page {
 	// ---------------------------------------------------------------------------
 
 	public static function maybe_show_notice(): void {
+		// Warn if IP check is disabled — visible on ALL admin pages so it's hard to miss
+		if ( BDSK_Settings::get( 'disable_ip_check' ) && BDSK_Settings::get( 'enabled' ) ) {
+			echo '<div class="notice notice-warning"><p><strong>Behdashtik Mirror Connector:</strong> IP check is disabled. Only use this in local development, never in production.</p></div>';
+		}
+
 		$screen = get_current_screen();
 		if ( ! $screen || 'settings_page_' . self::PAGE_SLUG !== $screen->id ) {
 			return;
 		}
 
-		// IP check disabled warning
-		if ( BDSK_Settings::get( 'disable_ip_check' ) ) {
-			echo '<div class="notice notice-warning"><p><strong>Behdashtik Mirror Connector:</strong> IP check is disabled. This should only be used during local development.</p></div>';
-		}
-
-		// Using hash-stored key warning
-		if ( ! BDSK_Security::using_constant() && '' !== BDSK_Settings::get( 'api_key_hash' ) ) {
-			echo '<div class="notice notice-info"><p><strong>Behdashtik Mirror Connector:</strong> You are using a stored key hash. For better security, define <code>BDSK_API_SECRET</code> in wp-config.php and leave the key field blank.</p></div>';
-		}
-
-		// Cleanup confirmation
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		if ( isset( $_GET['bdsk_notice'] ) && 'cleanup_done' === $_GET['bdsk_notice'] ) {
 			echo '<div class="notice notice-success is-dismissible"><p><strong>Behdashtik Mirror Connector:</strong> Emergency cleanup completed.</p></div>';
@@ -199,10 +239,52 @@ class BDSK_Settings_Page {
 			wp_die( 'Unauthorised.' );
 		}
 
-		$settings = BDSK_Settings::all();
+		$settings         = BDSK_Settings::all();
+		$using_constant   = BDSK_Security::using_constant();
+		$using_encrypted  = BDSK_Security::using_encrypted_option();
+		$has_secret       = BDSK_Security::has_secret();
+		$openssl_ok       = extension_loaded( 'openssl' );
+
+		// ---- Show-once new-key flash ----
+		$flash_key = get_transient( 'bdsk_flash_new_key' );
+		if ( $flash_key ) {
+			delete_transient( 'bdsk_flash_new_key' ); // shown exactly once
+			?>
+			<div class="notice notice-warning" style="padding:16px">
+				<p><strong>&#x26A0; Save this API key now — it will not be shown again.</strong></p>
+				<p>Copy it into your <code>config.json</code> on Server 2 as the <code>api_secret</code> value.</p>
+				<div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+					<input
+						type="text"
+						id="bdsk-new-key"
+						value="<?php echo esc_attr( $flash_key ); ?>"
+						readonly
+						style="font-family:monospace;width:520px;font-size:13px"
+					/>
+					<button
+						type="button"
+						onclick="navigator.clipboard.writeText(document.getElementById('bdsk-new-key').value).then(function(){this.textContent='Copied!';}.bind(this))"
+						class="button"
+					>Copy</button>
+				</div>
+			</div>
+			<?php
+		}
 		?>
 		<div class="wrap">
 			<h1>Behdashtik Mirror Connector</h1>
+
+			<?php if ( ! $has_secret && ! $using_constant ) : ?>
+			<div class="notice notice-error">
+				<p><strong>No API key configured.</strong> Generate one below to allow Server 2 to connect.</p>
+			</div>
+			<?php endif; ?>
+
+			<?php if ( $using_encrypted && ! extension_loaded( 'openssl' ) ) : ?>
+			<div class="notice notice-error">
+				<p><strong>OpenSSL extension not available.</strong> The stored API key cannot be decrypted. Enable <code>extension=openssl</code> in php.ini and reload.</p>
+			</div>
+			<?php endif; ?>
 
 			<form method="post" action="options.php">
 				<?php
@@ -214,15 +296,76 @@ class BDSK_Settings_Page {
 
 			<hr />
 
+			<h2>API Key</h2>
+
+			<?php if ( $using_constant ) : ?>
+			<p><span style="color:green">&#x2713; API secret is set via the <code>BDSK_API_SECRET</code> constant in wp-config.php.</span> Key generation is disabled while the constant is defined.</p>
+
+			<?php elseif ( ! $openssl_ok ) : ?>
+			<p style="color:#d63638">&#x26A0; <strong>OpenSSL not available.</strong> Encrypted key storage requires the PHP OpenSSL extension. Enable it in php.ini to use this feature.</p>
+
+			<?php else : ?>
+				<?php if ( $has_secret ) : ?>
+				<p>
+					<span style="color:green">&#x2713; An API key is stored (encrypted at rest with AES-256-CBC).</span>
+					If you have lost the key, regenerate it below — the old key will be invalidated immediately.
+				</p>
+				<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>"
+				      onsubmit="return confirm('Regenerate the API key? The old key will stop working immediately.');">
+					<input type="hidden" name="action" value="bdsk_generate_key" />
+					<?php wp_nonce_field( 'bdsk_generate_key' ); ?>
+					<?php submit_button( 'Regenerate API Key', 'secondary', 'bdsk_regen', false ); ?>
+				</form>
+
+				<?php if ( '' !== BDSK_Settings::get( 'api_key_hash', '' ) ) : ?>
+				<details style="margin-top:12px">
+					<summary style="cursor:pointer;color:#646970">Legacy hash field (no longer needed)</summary>
+					<p class="description" style="margin-top:8px">
+						Your previous install used a manually-entered key stored as a SHA-256 hash.
+						That hash is preserved for backward compatibility but the new encrypted key takes priority.
+						You can clear it by saving the settings form once (it will be retained as-is but the encrypted key will be used for authentication).
+					</p>
+				</details>
+				<?php endif; ?>
+
+				<?php else : ?>
+				<p>No API key has been configured yet. Click below to generate one.</p>
+				<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+					<input type="hidden" name="action" value="bdsk_generate_key" />
+					<?php wp_nonce_field( 'bdsk_generate_key' ); ?>
+					<?php submit_button( 'Generate API Key', 'primary', 'bdsk_generate', false ); ?>
+				</form>
+				<?php endif; ?>
+
+			<?php endif; ?>
+
+			<hr />
+
 			<h2>Status</h2>
-			<table class="form-table">
+			<table class="form-table widefat" style="width:auto">
 				<tr>
 					<th>Plugin Version</th>
 					<td><?php echo esc_html( BDSK_VERSION ); ?></td>
 				</tr>
 				<tr>
 					<th>API Secret Source</th>
-					<td><?php echo BDSK_Security::using_constant() ? '<span style="color:green">✓ wp-config.php constant</span>' : '<span style="color:orange">⚠ Stored hash (fallback)</span>'; ?></td>
+					<td>
+						<?php
+						if ( $using_constant ) {
+							echo '<span style="color:green">wp-config.php constant</span>';
+						} elseif ( $using_encrypted ) {
+							echo '<span style="color:green">Encrypted option (AES-256-CBC)</span>';
+						} elseif ( '' !== BDSK_Settings::get( 'api_key_hash', '' ) ) {
+							echo '<span style="color:orange">Legacy hash (regenerate recommended)</span>';
+						} else {
+							echo '<span style="color:#d63638">Not configured</span>';
+						}
+						?>
+					</td>
+				</tr>
+				<tr>
+					<th>OpenSSL Available</th>
+					<td><?php echo $openssl_ok ? '<span style="color:green">Yes</span>' : '<span style="color:#d63638">No — key storage disabled</span>'; ?></td>
 				</tr>
 				<tr>
 					<th>Last Successful Request</th>
@@ -241,9 +384,9 @@ class BDSK_Settings_Page {
 			<hr />
 
 			<h2>Emergency Cleanup</h2>
-			<p>Deletes all export archive files from disk, marks all pending/running jobs as failed, and clears all cleanup queues. Use this if something went wrong and you need a clean slate.</p>
+			<p>Deletes all export archive files from disk, marks all active jobs as failed, and cancels queued export tasks. Use this if something went wrong and you need a clean slate.</p>
 			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>"
-			      onsubmit="return confirm('Delete all export archives and reset job state?');">
+			      onsubmit="return confirm('Delete all export archives and reset all job state?');">
 				<input type="hidden" name="action" value="bdsk_emergency_cleanup" />
 				<?php wp_nonce_field( 'bdsk_emergency_cleanup' ); ?>
 				<?php submit_button( 'Run Emergency Cleanup', 'delete', 'bdsk_emergency', false ); ?>

@@ -466,6 +466,9 @@ class BDSK_Export_Job {
 		// that legitimately contain '%' (e.g. URL-encoded slugs).
 		// mysqli_real_escape_string() escapes only actual MySQL string-literal
 		// special chars (\0 \n \r \ ' " \Z) and never touches '%'.
+		if ( ! ( $wpdb->dbh instanceof mysqli ) ) {
+			throw new \RuntimeException( 'BDSK requires a MySQLi database driver.' );
+		}
 		return "'" . mysqli_real_escape_string( $wpdb->dbh, (string) $value ) . "'";
 	}
 
