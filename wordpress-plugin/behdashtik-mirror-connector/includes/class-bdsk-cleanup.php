@@ -12,10 +12,10 @@ class BDSK_Cleanup {
 	}
 
 	public static function schedule_recurring(): void {
-		if ( ! function_exists( 'as_next_scheduled_action' ) ) {
+		if ( ! function_exists( 'as_has_scheduled_action' ) ) {
 			return;
 		}
-		if ( ! as_next_scheduled_action( self::AS_CLEANUP_HOOK ) ) {
+		if ( ! as_has_scheduled_action( self::AS_CLEANUP_HOOK ) ) {
 			as_schedule_recurring_action( time(), HOUR_IN_SECONDS, self::AS_CLEANUP_HOOK, [], 'bdsk' );
 		}
 	}

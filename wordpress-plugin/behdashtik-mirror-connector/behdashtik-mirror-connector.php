@@ -69,8 +69,7 @@ function bdsk_base64url_decode( string $data ): string {
 
 register_activation_hook( __FILE__, static function () {
 	BDSK_DB::create_tables();
-	BDSK_Cleanup::schedule_recurring();
-	BDSK_Export_Job::schedule_heartbeat_check();
+	// Scheduling is handled by the `init` hook on first load after activation.
 } );
 
 register_deactivation_hook( __FILE__, static function () {
@@ -81,12 +80,7 @@ register_deactivation_hook( __FILE__, static function () {
 } );
 
 add_action( 'plugins_loaded', static function () {
-	// Ensure recurring schedules survive plugin updates / re-activations.
-	if ( function_exists( 'as_next_scheduled_action' ) ) {
-		BDSK_Cleanup::schedule_recurring();
-		BDSK_Export_Job::schedule_heartbeat_check();
-	}
-
+	// Register REST routes, AS hook handlers, and admin UI — safe at plugins_loaded.
 	BDSK_Export_Rest::init();
 	BDSK_Cleanup::init();
 	BDSK_Export_Job::init_scheduler();
@@ -95,3 +89,13 @@ add_action( 'plugins_loaded', static function () {
 		BDSK_Settings_Page::init();
 	}
 } );
+
+// Action Scheduler API (as_has_scheduled_action, as_schedule_recurring_action, etc.)
+// must NOT be called before the AS data store is initialized.
+// The AS docs explicitly state: call these at `init` or later.
+add_action( 'init', static function () {
+	if ( function_exists( 'as_has_scheduled_action' ) ) {
+		BDSK_Cleanup::schedule_recurring();
+		BDSK_Export_Job::schedule_heartbeat_check();
+	}
+}, 20 );

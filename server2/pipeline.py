@@ -50,6 +50,17 @@ def load_config() -> dict:
 # HTTP client helpers
 # ---------------------------------------------------------------------------
 
+def _parse_json(text: str, context: str) -> dict:
+    """Parse JSON from a response body that may have a PHP notice/warning prefix."""
+    start = text.find("{")
+    if start == -1:
+        raise RuntimeError(f"{context}: response contains no JSON object — body: {text[:300]}")
+    prefix = text[:start].strip()
+    if prefix:
+        print(f"[warn] {context}: stripped non-JSON prefix ({len(prefix)} chars): {prefix[:120]!r}")
+    return json.loads(text[start:])
+
+
 def api_get(cfg: dict, path: str, params: dict | None = None) -> dict:
     url = cfg["wp_base_url"].rstrip("/") + "/wp-json/behdashtik-connector/v1" + path
     resp = requests.get(
@@ -60,7 +71,31 @@ def api_get(cfg: dict, path: str, params: dict | None = None) -> dict:
     )
     if not resp.ok:
         raise RuntimeError(f"GET {path} failed: {resp.status_code} — {resp.text[:300]}")
-    return resp.json()
+    return _parse_json(resp.text, f"GET {path}")
+
+
+def _trigger_as_queue(cfg: dict) -> None:
+    """Kick Action Scheduler so it processes the export chunk queue.
+
+    In production, WP-Cron fires on every page load and drives AS automatically —
+    no action needed here.  In local dev (Docker with no real traffic), the
+    WP-Cron loopback can't reach `localhost:8080` from inside the container, so
+    AS never runs on its own.
+
+    Set `as_runner_cmd` in config.json to a shell command that triggers the queue
+    (e.g. `docker compose exec -T wpcli wp cron event run action_scheduler_run_queue`).
+    The command is run fire-and-forget; failures are suppressed so polling continues.
+    """
+    cmd = cfg.get("as_runner_cmd")
+    if not cmd:
+        return
+    try:
+        subprocess.Popen(
+            cmd, shell=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
 
 
 def api_post(cfg: dict, path: str, body: dict | None = None) -> dict:
@@ -76,7 +111,7 @@ def api_post(cfg: dict, path: str, body: dict | None = None) -> dict:
     )
     if not resp.ok and resp.status_code not in (409,):
         raise RuntimeError(f"POST {path} failed: {resp.status_code} — {resp.text[:300]}")
-    return resp.json()
+    return _parse_json(resp.text, f"POST {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -130,13 +165,13 @@ def start_export(cfg: dict, test_mode: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 def poll_until_ready(cfg: dict, job_id: str) -> dict:
-    interval = cfg.get("poll_interval_seconds", 5)
-    timeout  = cfg.get("poll_timeout_seconds", 3600)
-    deadline = time.time() + timeout
-
+    interval     = cfg.get("poll_interval_seconds", 5)
+    timeout      = cfg.get("poll_timeout_seconds", 3600)
+    deadline     = time.time() + timeout
     print(f"[poll] Waiting for job {job_id} to become ready …")
 
     while time.time() < deadline:
+        _trigger_as_queue(cfg)
         data = api_get(cfg, f"/db-export/status/{job_id}")
         status   = data.get("status")
         progress = data.get("progress_percent", 0)
@@ -292,8 +327,13 @@ def import_archive(cfg: dict, job_id: str, job_dir: pathlib.Path) -> str:
             staging,
         ]
 
+        # gzip.GzipFile.fileno() exposes the underlying *compressed* fd, so we
+        # must not pass the GzipFile directly as subprocess stdin — mysql would
+        # receive raw gzip bytes.  Decompress to memory and feed via input=.
         with gzip.open(str(gz_path), "rb") as gz_in:
-            result = subprocess.run(cmd, stdin=gz_in, capture_output=True)
+            sql_bytes = gz_in.read()
+
+        result = subprocess.run(cmd, input=sql_bytes, capture_output=True)
 
         if result.returncode != 0:
             raise RuntimeError(

@@ -9,6 +9,14 @@ class BDSK_Export_Rest {
 
 	public static function init(): void {
 		add_action( 'rest_api_init', [ __CLASS__, 'register_routes' ] );
+		// Discard any output (PHP notices/warnings) that accumulated before the REST
+		// response is sent. This prevents stray text from corrupting JSON or binary downloads.
+		add_filter( 'rest_pre_serve_request', static function ( $served ) {
+			while ( ob_get_level() ) {
+				ob_end_clean();
+			}
+			return $served;
+		}, 1 );
 	}
 
 	public static function register_routes(): void {

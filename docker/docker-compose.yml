@@ -1,12 +1,10 @@
-version: "3.9"
-
 # Local testing environment for Behdashtik Mirror Connector
 # ============================================================
 # Usage:
 #   docker compose up -d
-#   docker compose exec wpcli wp plugin activate behdashtik-mirror-connector
-#   docker compose exec wpcli wp wc tool run install_pages --user=1
-#   docker compose exec wpcli wp post create --post_title="Test" --post_status=publish
+#   docker compose exec wpcli wp core install --url=http://localhost:8080 --title="Behdashtik Test" --admin_user=admin --admin_password=admin --admin_email=admin@test.local --skip-email
+#   docker compose exec wpcli wp plugin activate behdashtik-mirror-connector woocommerce
+#   docker compose exec wpcli wp rewrite structure '/%postname%/' --hard
 #
 # WP Admin: http://localhost:8080/wp-admin  (admin / admin)
 # Mirror DB: localhost:3307  (root / mirrorpass)
@@ -17,17 +15,20 @@ services:
   # WordPress source site (with WooCommerce)
   # ------------------------------------------------------------------
   wordpress:
-    image: wordpress:6.5-php8.2-apache
+    image: wordpress:6.9-php8.2-apache
     depends_on:
       - wp_db
     ports:
       - "8080:80"
     environment:
-      WORDPRESS_DB_HOST:     wp_db:3306
-      WORDPRESS_DB_USER:     wpuser
-      WORDPRESS_DB_PASSWORD: wppass
-      WORDPRESS_DB_NAME:     wordpress
-      WORDPRESS_DEBUG:       "1"
+      WORDPRESS_DB_HOST:        wp_db:3306
+      WORDPRESS_DB_USER:        wpuser
+      WORDPRESS_DB_PASSWORD:    wppass
+      WORDPRESS_DB_NAME:        wordpress
+      # Notices/warnings go to debug.log, never to HTTP responses
+      WORDPRESS_DEBUG:          "1"
+      WORDPRESS_DEBUG_LOG:      "1"
+      WORDPRESS_DEBUG_DISPLAY:  "0"
     volumes:
       - wp_data:/var/www/html
       # Mount the plugin directory directly so changes are live
@@ -48,16 +49,22 @@ services:
       - internal
 
   # WP-CLI service for one-off commands
+  # user: "33:33" matches the Debian www-data UID used by the wordpress container,
+  # preventing the UID-mismatch that blocked plugin installs into the shared volume.
   wpcli:
     image: wordpress:cli-php8.2
+    user: "33:33"
     depends_on:
       - wordpress
       - wp_db
     environment:
-      WORDPRESS_DB_HOST:     wp_db:3306
-      WORDPRESS_DB_USER:     wpuser
-      WORDPRESS_DB_PASSWORD: wppass
-      WORDPRESS_DB_NAME:     wordpress
+      WORDPRESS_DB_HOST:        wp_db:3306
+      WORDPRESS_DB_USER:        wpuser
+      WORDPRESS_DB_PASSWORD:    wppass
+      WORDPRESS_DB_NAME:        wordpress
+      WORDPRESS_DEBUG:          "1"
+      WORDPRESS_DEBUG_LOG:      "1"
+      WORDPRESS_DEBUG_DISPLAY:  "0"
     volumes:
       - wp_data:/var/www/html
       - ../wordpress-plugin/behdashtik-mirror-connector:/var/www/html/wp-content/plugins/behdashtik-mirror-connector

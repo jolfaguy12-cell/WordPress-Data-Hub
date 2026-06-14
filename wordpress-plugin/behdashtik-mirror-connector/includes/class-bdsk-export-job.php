@@ -18,10 +18,10 @@ class BDSK_Export_Job {
 	}
 
 	public static function schedule_heartbeat_check(): void {
-		if ( ! function_exists( 'as_next_scheduled_action' ) ) {
+		if ( ! function_exists( 'as_has_scheduled_action' ) ) {
 			return;
 		}
-		if ( ! as_next_scheduled_action( self::AS_HEARTBEAT_HOOK ) ) {
+		if ( ! as_has_scheduled_action( self::AS_HEARTBEAT_HOOK ) ) {
 			as_schedule_recurring_action( time(), 300, self::AS_HEARTBEAT_HOOK, [], 'bdsk' );
 		}
 	}
