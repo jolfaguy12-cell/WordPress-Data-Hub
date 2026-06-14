@@ -1,0 +1,48 @@
+<?php
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+class BDSK_Health {
+
+	public static function get_data(): array {
+		global $wpdb;
+
+		// WooCommerce detection
+		$wc_active  = class_exists( 'WooCommerce' );
+		$wc_version = $wc_active && defined( 'WC_VERSION' ) ? WC_VERSION : null;
+
+		// DB version (MySQL or MariaDB)
+		$db_version = $wpdb->get_var( 'SELECT VERSION()' );
+
+		// gzip / zlib availability
+		$gzip_available = function_exists( 'gzopen' ) && function_exists( 'gzencode' );
+
+		// PHP memory limit and max_execution_time
+		$memory_limit   = ini_get( 'memory_limit' );
+		$max_exec_time  = (int) ini_get( 'max_execution_time' );
+
+		$settings = BDSK_Settings::all();
+
+		return [
+			'status'                  => 'ok',
+			'site_url'                => get_site_url(),
+			'plugin_version'          => BDSK_VERSION,
+			'wordpress_version'       => get_bloginfo( 'version' ),
+			'woocommerce_active'      => $wc_active,
+			'woocommerce_version'     => $wc_version,
+			'php_version'             => PHP_VERSION,
+			'mysql_or_mariadb_version' => $db_version,
+			'gzip_or_zlib_available'  => $gzip_available,
+			'memory_limit'            => $memory_limit,
+			'max_execution_time'      => $max_exec_time,
+			'server_time'             => gmdate( 'c' ),
+			'db_prefix'               => $wpdb->prefix,
+			'connector_enabled'       => (bool) $settings['enabled'],
+			'read_mode_status'        => $settings['read_access_enabled'] ? 'on' : 'off',
+			'write_mode_status'       => 'off', // Phase 1: always off
+			'backup_export_enabled'   => (bool) $settings['backup_export_enabled'],
+			'last_successful_request' => $settings['last_successful_request'] ?: null,
+		];
+	}
+}

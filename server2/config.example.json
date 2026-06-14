@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy this file to config.json and fill in your values. Never commit config.json.",
+  "wp_base_url": "https://your-wordpress-site.com",
+  "api_secret": "your-long-random-secret-here",
+  "archive_storage_path": "/datahub/db-archives",
+  "mirror_db": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "mirror_import_user",
+    "password": "strong-password-here",
+    "name": "behdashtik_wp_mirror",
+    "readonly_user": "mirror_readonly_user",
+    "readonly_password": "readonly-password-here"
+  },
+  "poll_interval_seconds": 5,
+  "poll_timeout_seconds": 3600,
+  "request_timeout_seconds": 60
+}
