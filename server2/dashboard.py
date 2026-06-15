@@ -12,6 +12,8 @@ Bootstrap users:   python3 dashboard.py --create-user
 import argparse
 import getpass
 import hashlib
+import hmac
+import json
 import pathlib
 import secrets
 import sqlite3
@@ -48,6 +50,29 @@ def init_db() -> None:
                 password_hash  TEXT NOT NULL,
                 created_at     TEXT NOT NULL,
                 last_login_at  TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS webhook_endpoints (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                name         TEXT NOT NULL,
+                url          TEXT NOT NULL,
+                secret       TEXT NOT NULL,
+                event_filter TEXT NOT NULL,
+                enabled      INTEGER NOT NULL DEFAULT 1,
+                created_at   TEXT NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                endpoint_id INTEGER NOT NULL,
+                event       TEXT NOT NULL,
+                entity_id   INTEGER NOT NULL,
+                sent_at     TEXT NOT NULL,
+                http_status INTEGER,
+                success     INTEGER NOT NULL,
+                error       TEXT
             )
         """)
 
@@ -113,6 +138,94 @@ def record_login(uid: int) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with _db() as cur:
         cur.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now, uid))
+
+
+# ---------------------------------------------------------------------------
+# Webhook DB helpers
+# ---------------------------------------------------------------------------
+
+ALL_EVENTS = ["product.upserted", "product.deleted", "order.upserted", "order.deleted"]
+
+
+def list_endpoints() -> list:
+    with _db() as cur:
+        cur.execute("SELECT * FROM webhook_endpoints ORDER BY id")
+        return cur.fetchall()
+
+
+def get_endpoint(eid: int) -> sqlite3.Row | None:
+    with _db() as cur:
+        cur.execute("SELECT * FROM webhook_endpoints WHERE id = ?", (eid,))
+        return cur.fetchone()
+
+
+def create_endpoint(name: str, url: str, event_filter: list) -> tuple[int, str]:
+    new_secret = secrets.token_hex(32)
+    now        = datetime.now(timezone.utc).isoformat()
+    with _db() as cur:
+        cur.execute(
+            "INSERT INTO webhook_endpoints (name, url, secret, event_filter, enabled, created_at) "
+            "VALUES (?, ?, ?, ?, 1, ?)",
+            (name, url, new_secret, json.dumps(event_filter), now),
+        )
+        return cur.lastrowid, new_secret
+
+
+def update_endpoint(eid: int, name: str, url: str, event_filter: list, enabled: bool) -> None:
+    with _db() as cur:
+        cur.execute(
+            "UPDATE webhook_endpoints SET name=?, url=?, event_filter=?, enabled=? WHERE id=?",
+            (name, url, json.dumps(event_filter), 1 if enabled else 0, eid),
+        )
+
+
+def delete_endpoint(eid: int) -> None:
+    with _db() as cur:
+        cur.execute("DELETE FROM webhook_endpoints WHERE id = ?", (eid,))
+        cur.execute("DELETE FROM webhook_deliveries WHERE endpoint_id = ?", (eid,))
+
+
+def regenerate_secret(eid: int) -> str:
+    new_secret = secrets.token_hex(32)
+    with _db() as cur:
+        cur.execute("UPDATE webhook_endpoints SET secret=? WHERE id=?", (new_secret, eid))
+    return new_secret
+
+
+def list_deliveries(limit: int = 60, endpoint_id: int | None = None) -> list:
+    with _db() as cur:
+        if endpoint_id is not None:
+            cur.execute(
+                "SELECT d.*, e.name AS endpoint_name FROM webhook_deliveries d "
+                "JOIN webhook_endpoints e ON d.endpoint_id = e.id "
+                "WHERE d.endpoint_id = ? ORDER BY d.id DESC LIMIT ?",
+                (endpoint_id, limit),
+            )
+        else:
+            cur.execute(
+                "SELECT d.*, e.name AS endpoint_name FROM webhook_deliveries d "
+                "JOIN webhook_endpoints e ON d.endpoint_id = e.id "
+                "ORDER BY d.id DESC LIMIT ?",
+                (limit,),
+            )
+        return cur.fetchall()
+
+
+def get_endpoint_last_delivery(eid: int) -> sqlite3.Row | None:
+    with _db() as cur:
+        cur.execute(
+            "SELECT success, http_status, sent_at FROM webhook_deliveries "
+            "WHERE endpoint_id = ? ORDER BY id DESC LIMIT 1",
+            (eid,),
+        )
+        return cur.fetchone()
+
+
+def prune_webhook_deliveries() -> int:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    with _db() as cur:
+        cur.execute("DELETE FROM webhook_deliveries WHERE sent_at < ?", (cutoff,))
+        return cur.rowcount
 
 
 # ---------------------------------------------------------------------------
@@ -288,11 +401,36 @@ td { padding: 10px 14px; border-bottom: 1px solid #f3f4f6; color: #374151 }
 tr:last-child td { border-bottom: none }
 .actions { display: flex; gap: 6px; align-items: center }
 
-/* Add-user form */
+/* Add-user form / add-endpoint form */
 .add-form { background: #fff; border-radius: 10px; padding: 20px;
             box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-top: 24px }
 .add-form .inline { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end }
 .add-form .inline .form-group { margin-bottom: 0; flex: 1; min-width: 140px }
+
+/* Secret reveal box */
+.secret-box { background: #f0fdf4; border: 1px solid #86efac; border-radius: 8px;
+              padding: 14px 16px; margin-bottom: 18px }
+.secret-box .label { font-size: .78rem; font-weight: 600; color: #166534;
+                     text-transform: uppercase; letter-spacing: .05em; margin-bottom: 6px }
+.secret-box code { font-family: ui-monospace, monospace; font-size: .85rem;
+                   word-break: break-all; color: #14532d; display: block }
+
+/* Event filter checkboxes */
+.check-group { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 6px }
+.check-group label { display: flex; align-items: center; gap: 6px;
+                     font-size: .85rem; font-weight: 400; color: #374151; cursor: pointer }
+.check-group input[type=checkbox] { width: auto; accent-color: #2563eb }
+
+/* Status dot */
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+       margin-right: 5px; vertical-align: middle }
+.dot-ok  { background: #22c55e }
+.dot-err { background: #ef4444 }
+.dot-off { background: #9ca3af }
+
+/* URL cell truncation */
+.url-cell { max-width: 260px; overflow: hidden; text-overflow: ellipsis;
+            white-space: nowrap; font-size: .82rem; color: #6b7280 }
 
 @media (max-width: 600px) {
   .page { padding: 16px }
@@ -317,6 +455,7 @@ BASE = """\
   <span class="brand">&#x1F4CA; Behdashtik Hub</span>
   <a href="{{ url_for('dashboard') }}" class="{{ 'active' if active == 'dashboard' }}">Dashboard</a>
   <a href="{{ url_for('users_page') }}" class="{{ 'active' if active == 'users' }}">Users</a>
+  <a href="{{ url_for('webhooks_page') }}" class="{{ 'active' if active == 'webhooks' }}">Webhooks</a>
   <span class="spacer"></span>
   <span class="user-chip">{{ current_user }}</span>
   <form method="post" action="{{ url_for('logout') }}" style="margin:0">
@@ -506,6 +645,144 @@ USERS_PAGE = """\
 </div>
 {% endblock %}"""
 
+WEBHOOKS_PAGE = """\
+{% extends 'base.html' %}
+{% block title %}Webhooks — Behdashtik Hub{% endblock %}
+{% block body %}
+<div class="page">
+  <h1>Webhooks</h1>
+
+  {%- if new_secret %}
+  <div class="secret-box">
+    <div class="label">Secret — copy it now, it won't be shown again</div>
+    <code>{{ new_secret }}</code>
+    <div style="margin-top:8px;font-size:.8rem;color:#166534">
+      Send <strong>X-BDSK-Signature: hmac-sha256(body, secret)</strong> to verify deliveries.
+    </div>
+  </div>
+  {%- endif %}
+
+  <div class="card" style="margin-bottom:24px">
+    <h2>Endpoints</h2>
+    {%- if endpoints %}
+    <table>
+      <thead><tr>
+        <th>Name</th><th>URL</th><th>Events</th><th>Status</th><th>Last delivery</th><th>Actions</th>
+      </tr></thead>
+      <tbody>
+      {%- for ep in endpoints %}
+      {%- set ld = last_deliveries.get(ep['id']) %}
+      <tr>
+        <td><strong>{{ ep['name'] }}</strong></td>
+        <td><div class="url-cell" title="{{ ep['url'] }}">{{ ep['url'] }}</div></td>
+        <td style="font-size:.8rem">
+          {%- for evt in ep['event_filter_parsed'] %}
+          <span class="badge badge-ok" style="margin:1px 2px;padding:1px 6px">{{ evt }}</span>
+          {%- endfor %}
+        </td>
+        <td>
+          {%- if ep['enabled'] %}
+          <span class="badge badge-ok">enabled</span>
+          {%- else %}
+          <span class="badge" style="background:#f3f4f6;color:#6b7280">disabled</span>
+          {%- endif %}
+        </td>
+        <td style="font-size:.82rem">
+          {%- if ld %}
+          <span class="dot {{ 'dot-ok' if ld['success'] else 'dot-err' }}"></span>
+          {{ ld['sent_at'][:19].replace('T',' ') if ld['sent_at'] else '—' }}
+          {%- if ld['http_status'] %} ({{ ld['http_status'] }}){%- endif %}
+          {%- else %}never{%- endif %}
+        </td>
+        <td>
+          <div class="actions">
+            <form method="post" action="{{ url_for('webhook_toggle', eid=ep['id']) }}">
+              <button class="btn btn-secondary">{{ 'Disable' if ep['enabled'] else 'Enable' }}</button>
+            </form>
+            <form method="post" action="{{ url_for('webhook_regen_secret', eid=ep['id']) }}"
+                  onsubmit="return confirm('Regenerate secret for {{ ep[\'name\'] }}? Old secret stops working immediately.')">
+              <button class="btn btn-secondary">New secret</button>
+            </form>
+            <form method="post" action="{{ url_for('webhook_delete', eid=ep['id']) }}"
+                  onsubmit="return confirm('Delete {{ ep[\'name\'] }}?')">
+              <button class="btn btn-danger">Delete</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      {%- endfor %}
+      </tbody>
+    </table>
+    {%- else %}
+    <p style="color:#6b7280;font-size:.9rem;padding:12px 0">
+      No endpoints yet. Add one below to start receiving event notifications.
+    </p>
+    {%- endif %}
+  </div>
+
+  <div class="add-form">
+    <h2>Add endpoint</h2>
+    <form method="post" action="{{ url_for('webhook_add') }}">
+      <div class="inline" style="margin-bottom:14px">
+        <div class="form-group">
+          <label>Name</label>
+          <input type="text" name="name" placeholder="My integration" required>
+        </div>
+        <div class="form-group" style="flex:2;min-width:220px">
+          <label>URL</label>
+          <input type="url" name="url" placeholder="https://..." required>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Events to send</label>
+        <div class="check-group">
+          {%- for evt in all_events %}
+          <label>
+            <input type="checkbox" name="events" value="{{ evt }}" checked>
+            {{ evt }}
+          </label>
+          {%- endfor %}
+        </div>
+      </div>
+      <div style="margin-top:14px">
+        <button type="submit" class="btn btn-primary">Add endpoint</button>
+      </div>
+    </form>
+  </div>
+
+  {%- if deliveries %}
+  <div class="card" style="margin-top:24px">
+    <h2>Recent deliveries</h2>
+    <table>
+      <thead><tr>
+        <th>Time</th><th>Endpoint</th><th>Event</th><th>Entity</th><th>Status</th>
+      </tr></thead>
+      <tbody>
+      {%- for d in deliveries %}
+      <tr>
+        <td style="font-size:.82rem;white-space:nowrap">{{ d['sent_at'][:19].replace('T',' ') if d['sent_at'] else '—' }}</td>
+        <td>{{ d['endpoint_name'] }}</td>
+        <td><code style="font-size:.82rem">{{ d['event'] }}</code></td>
+        <td style="font-size:.82rem">id={{ d['entity_id'] }}</td>
+        <td>
+          {%- if d['success'] %}
+          <span class="badge badge-ok">{{ d['http_status'] or 'ok' }}</span>
+          {%- else %}
+          <span class="badge badge-err" title="{{ d['error'] or '' }}">
+            {{ d['http_status'] or 'err' }}
+          </span>
+          {%- endif %}
+        </td>
+      </tr>
+      {%- endfor %}
+      </tbody>
+    </table>
+  </div>
+  {%- endif %}
+
+</div>
+{% endblock %}"""
+
 # Wire all templates into Flask's Jinja2 environment via DictLoader so that
 # {% extends 'base.html' %} works correctly across render_template() calls.
 app.jinja_loader = jinja2.DictLoader({
@@ -513,6 +790,7 @@ app.jinja_loader = jinja2.DictLoader({
     "login.html":     LOGIN_PAGE,
     "dashboard.html": DASHBOARD_PAGE,
     "users.html":     USERS_PAGE,
+    "webhooks.html":  WEBHOOKS_PAGE,
 })
 
 
@@ -713,6 +991,123 @@ def change_password(uid: int):
     update_password(uid, new_pw)
     flash(f"Password updated for '{row['username']}'.", "ok")
     return redirect(url_for("users_page"))
+
+
+# ---------------------------------------------------------------------------
+# Routes — webhooks
+# ---------------------------------------------------------------------------
+
+@app.route("/webhooks")
+def webhooks_page():
+    redir = _require_login()
+    if redir:
+        return redir
+
+    endpoints_raw = list_endpoints()
+    endpoints_out = []
+    last_deliveries: dict[int, sqlite3.Row] = {}
+    for ep in endpoints_raw:
+        ep_dict = dict(ep)
+        try:
+            ep_dict["event_filter_parsed"] = json.loads(ep["event_filter"])
+        except Exception:
+            ep_dict["event_filter_parsed"] = ALL_EVENTS
+        endpoints_out.append(ep_dict)
+        ld = get_endpoint_last_delivery(ep["id"])
+        if ld:
+            last_deliveries[ep["id"]] = dict(ld)
+
+    deliveries = [dict(d) for d in list_deliveries(limit=60)]
+
+    new_secret = session.pop("new_webhook_secret", None)
+
+    return _render("webhooks.html", active="webhooks",
+                   endpoints=endpoints_out,
+                   last_deliveries=last_deliveries,
+                   deliveries=deliveries,
+                   all_events=ALL_EVENTS,
+                   new_secret=new_secret)
+
+
+@app.route("/webhooks/add", methods=["POST"])
+def webhook_add():
+    redir = _require_login()
+    if redir:
+        return redir
+
+    name   = request.form.get("name", "").strip()
+    url    = request.form.get("url", "").strip()
+    events = request.form.getlist("events")
+
+    if not name or not url:
+        flash("Name and URL are required.", "err")
+        return redirect(url_for("webhooks_page"))
+    if not events:
+        flash("Select at least one event.", "err")
+        return redirect(url_for("webhooks_page"))
+    valid = [e for e in events if e in ALL_EVENTS]
+    if not valid:
+        flash("Invalid event selection.", "err")
+        return redirect(url_for("webhooks_page"))
+
+    _, new_secret = create_endpoint(name, url, valid)
+    session["new_webhook_secret"] = new_secret
+    flash(f"Endpoint '{name}' created.", "ok")
+    return redirect(url_for("webhooks_page"))
+
+
+@app.route("/webhooks/<int:eid>/toggle", methods=["POST"])
+def webhook_toggle(eid: int):
+    redir = _require_login()
+    if redir:
+        return redir
+
+    ep = get_endpoint(eid)
+    if not ep:
+        flash("Endpoint not found.", "err")
+        return redirect(url_for("webhooks_page"))
+
+    try:
+        ef = json.loads(ep["event_filter"])
+    except Exception:
+        ef = ALL_EVENTS
+    update_endpoint(eid, ep["name"], ep["url"], ef, not bool(ep["enabled"]))
+    state = "enabled" if not ep["enabled"] else "disabled"
+    flash(f"Endpoint '{ep['name']}' {state}.", "ok")
+    return redirect(url_for("webhooks_page"))
+
+
+@app.route("/webhooks/<int:eid>/regenerate-secret", methods=["POST"])
+def webhook_regen_secret(eid: int):
+    redir = _require_login()
+    if redir:
+        return redir
+
+    ep = get_endpoint(eid)
+    if not ep:
+        flash("Endpoint not found.", "err")
+        return redirect(url_for("webhooks_page"))
+
+    new_secret = regenerate_secret(eid)
+    session["new_webhook_secret"] = new_secret
+    flash(f"Secret regenerated for '{ep['name']}'.", "ok")
+    return redirect(url_for("webhooks_page"))
+
+
+@app.route("/webhooks/<int:eid>/delete", methods=["POST"])
+def webhook_delete(eid: int):
+    redir = _require_login()
+    if redir:
+        return redir
+
+    ep = get_endpoint(eid)
+    if not ep:
+        flash("Endpoint not found.", "err")
+        return redirect(url_for("webhooks_page"))
+
+    delete_endpoint(eid)
+    flash(f"Endpoint '{ep['name']}' deleted.", "ok")
+    return redirect(url_for("webhooks_page"))
 
 
 # ---------------------------------------------------------------------------

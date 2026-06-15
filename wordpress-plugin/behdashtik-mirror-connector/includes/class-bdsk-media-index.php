@@ -461,6 +461,11 @@ class BDSK_Media_Index {
 		if ( wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) {
 			return;
 		}
+		// Skip during bulk imports (WP_IMPORTING set by WP Importer, Basalam sync, etc.)
+		// to avoid N+1 get_post_meta() + upsert() + prune() calls on every product in the batch.
+		if ( defined( 'WP_IMPORTING' ) && WP_IMPORTING ) {
+			return;
+		}
 
 		$post_type = get_post_type( $post_id );
 

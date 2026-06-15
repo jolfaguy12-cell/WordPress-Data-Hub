@@ -17,10 +17,12 @@ import argparse
 import concurrent.futures
 import gzip
 import hashlib
+import hmac
 import json
 import os
 import pathlib
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -230,12 +232,15 @@ def download_archive(cfg: dict, job_id: str, status_data: dict) -> pathlib.Path:
         url = (
             cfg["wp_base_url"].rstrip("/")
             + f"/wp-json/behdashtik-connector/v1/db-export/download/{job_id}"
-            + f"?part={i}&token={token}"
+            + f"?part={i}"
         )
 
         with requests.get(
             url,
-            headers={"Authorization": f"Bearer {cfg['api_secret']}"},
+            headers={
+                "Authorization": f"Bearer {cfg['api_secret']}",
+                "X-BDSK-Download-Token": token,
+            },
             stream=True,
             timeout=None,  # large files — no timeout on download
         ) as r:
@@ -1232,6 +1237,260 @@ def _apply_product_upsert(cur, snapshot: dict) -> None:
         cur.execute(f"DELETE FROM {prefix}posts WHERE ID IN ({oph})", orphan_ids)
 
 
+# ---------------------------------------------------------------------------
+# Webhook Dispatcher
+# ---------------------------------------------------------------------------
+
+HUB_DB_PATH = pathlib.Path(__file__).parent / "hub.db"
+
+
+def _build_product_payload(snap: dict) -> dict:
+    post   = snap.get("post_row") or {}
+    meta   = {r["meta_key"]: r["meta_value"] for r in snap.get("meta", [])}
+    lookup = snap.get("lookup_row") or {}
+    terms  = snap.get("terms", [])
+
+    def _meta(key, default=None):
+        return meta.get(key, default)
+
+    def _term_ids(taxonomy):
+        for t in terms:
+            if t.get("taxonomy") == taxonomy:
+                return [int(x) for x in (t.get("term_ids") or [])]
+        return []
+
+    variations_out = []
+    for v in snap.get("variations", []):
+        vpost = v.get("post_row") or {}
+        vmeta = {r["meta_key"]: r["meta_value"] for r in v.get("meta", [])}
+        variations_out.append({
+            "id":             int(vpost.get("ID") or 0),
+            "status":         vpost.get("post_status", ""),
+            "sku":            vmeta.get("_sku") or "",
+            "price":          vmeta.get("_price") or "",
+            "regular_price":  vmeta.get("_regular_price") or "",
+            "sale_price":     vmeta.get("_sale_price") or "",
+            "stock_quantity": int(vmeta.get("_stock_quantity") or 0),
+            "stock_status":   vmeta.get("_stock_status") or "instock",
+            "manage_stock":   vmeta.get("_manage_stock") == "yes",
+        })
+
+    return {
+        "id":             int(post.get("ID") or 0),
+        "name":           post.get("post_title", ""),
+        "slug":           post.get("post_name", ""),
+        "status":         post.get("post_status", ""),
+        "type":           "variable" if variations_out else ("simple" if not int(post.get("post_parent") or 0) else "variation"),
+        "sku":            _meta("_sku") or lookup.get("sku") or "",
+        "price":          _meta("_price") or "",
+        "regular_price":  _meta("_regular_price") or "",
+        "sale_price":     _meta("_sale_price") or "",
+        "stock_quantity": int(_meta("_stock_quantity") or 0) if _meta("_stock_quantity") is not None else None,
+        "stock_status":   _meta("_stock_status") or lookup.get("stock_status") or "instock",
+        "manage_stock":   _meta("_manage_stock") == "yes",
+        "on_sale":        bool(int(lookup.get("onsale") or 0)),
+        "categories":     [{"id": i} for i in _term_ids("product_cat")],
+        "tags":           [{"id": i} for i in _term_ids("product_tag")],
+        "date_created":   post.get("post_date_gmt") or post.get("post_date", ""),
+        "date_modified":  post.get("post_modified_gmt") or post.get("post_modified", ""),
+        "parent_id":      int(post.get("post_parent") or 0),
+        "variations":     [v["id"] for v in variations_out],
+        "_variations":    variations_out,
+    }
+
+
+def _build_order_payload(snap: dict) -> dict:
+    order = snap.get("order_row") or {}
+    meta  = {r["meta_key"]: r["meta_value"] for r in snap.get("meta", [])}
+
+    def _meta(key, default=""):
+        return meta.get(key, default)
+
+    line_items    = []
+    shipping_lines = []
+    fee_lines     = []
+
+    for item_data in snap.get("items", []):
+        item     = item_data.get("item_row") or {}
+        imeta    = {r["meta_key"]: r["meta_value"] for r in item_data.get("itemmeta", [])}
+        item_type = item.get("order_item_type", "")
+
+        if item_type == "line_item":
+            line_items.append({
+                "id":           int(item.get("order_item_id") or 0),
+                "name":         item.get("order_item_name", ""),
+                "product_id":   int(imeta.get("_product_id") or 0),
+                "variation_id": int(imeta.get("_variation_id") or 0),
+                "quantity":     int(imeta.get("_qty") or 1),
+                "subtotal":     imeta.get("_line_subtotal") or "0",
+                "total":        imeta.get("_line_total") or "0",
+                "sku":          imeta.get("_sku") or "",
+            })
+        elif item_type == "shipping":
+            shipping_lines.append({
+                "id":           int(item.get("order_item_id") or 0),
+                "method_title": item.get("order_item_name", ""),
+                "method_id":    imeta.get("method_id") or "",
+                "total":        imeta.get("cost") or "0",
+            })
+        elif item_type == "fee":
+            fee_lines.append({
+                "id":    int(item.get("order_item_id") or 0),
+                "name":  item.get("order_item_name", ""),
+                "total": imeta.get("_line_total") or "0",
+            })
+
+    return {
+        "id":                    int(order.get("id") or 0),
+        "status":                (order.get("status") or "").replace("wc-", ""),
+        "currency":              order.get("currency", ""),
+        "date_created":          order.get("date_created_gmt") or "",
+        "date_modified":         order.get("date_updated_gmt") or "",
+        "total":                 str(order.get("total_amount") or ""),
+        "customer_id":           int(order.get("customer_id") or 0),
+        "customer_note":         _meta("_customer_note"),
+        "payment_method":        _meta("_payment_method"),
+        "payment_method_title":  _meta("_payment_method_title"),
+        "transaction_id":        _meta("_transaction_id"),
+        "billing": {
+            "first_name": _meta("_billing_first_name"),
+            "last_name":  _meta("_billing_last_name"),
+            "company":    _meta("_billing_company"),
+            "address_1":  _meta("_billing_address_1"),
+            "address_2":  _meta("_billing_address_2"),
+            "city":       _meta("_billing_city"),
+            "state":      _meta("_billing_state"),
+            "postcode":   _meta("_billing_postcode"),
+            "country":    _meta("_billing_country"),
+            "email":      _meta("_billing_email") or order.get("billing_email", ""),
+            "phone":      _meta("_billing_phone"),
+        },
+        "shipping": {
+            "first_name": _meta("_shipping_first_name"),
+            "last_name":  _meta("_shipping_last_name"),
+            "company":    _meta("_shipping_company"),
+            "address_1":  _meta("_shipping_address_1"),
+            "address_2":  _meta("_shipping_address_2"),
+            "city":       _meta("_shipping_city"),
+            "state":      _meta("_shipping_state"),
+            "postcode":   _meta("_shipping_postcode"),
+            "country":    _meta("_shipping_country"),
+        },
+        "line_items":     line_items,
+        "shipping_lines": shipping_lines,
+        "fee_lines":      fee_lines,
+    }
+
+
+def _get_active_endpoints(event_name: str) -> list[dict]:
+    if not HUB_DB_PATH.exists():
+        return []
+    conn = sqlite3.connect(HUB_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        # webhook_endpoints table may not exist yet (before first dashboard run)
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='webhook_endpoints'"
+        )
+        if not cur.fetchone():
+            return []
+        cur.execute(
+            "SELECT id, name, url, secret, event_filter FROM webhook_endpoints WHERE enabled=1"
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    result = []
+    for row in rows:
+        try:
+            filters = json.loads(row["event_filter"])
+        except Exception:
+            filters = ["product.upserted", "product.deleted", "order.upserted", "order.deleted"]
+        if event_name in filters:
+            result.append(row)
+    return result
+
+
+def _sign_webhook_body(body: bytes, secret: str) -> str:
+    return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+def _log_delivery(
+    endpoint_id: int, event: str, entity_id: int, sent_at: str,
+    http_status: int | None, success: bool, error: str | None,
+) -> None:
+    if not HUB_DB_PATH.exists():
+        return
+    conn = sqlite3.connect(HUB_DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO webhook_deliveries "
+            "(endpoint_id, event, entity_id, sent_at, http_status, success, error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (endpoint_id, event, entity_id, sent_at,
+             http_status, 1 if success else 0, error),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _dispatch_webhooks(
+    cfg: dict, entity_type: str, entity_id: int,
+    event_type: str, snap: dict | None,
+) -> None:
+    event_name = f"{entity_type}.{event_type}"
+    endpoints  = _get_active_endpoints(event_name)
+    if not endpoints:
+        return
+
+    if event_type == "deleted" or not (snap and snap.get("exists")):
+        data = {"id": entity_id}
+    elif entity_type == "order":
+        data = _build_order_payload(snap)
+    else:
+        data = _build_product_payload(snap)
+
+    payload = {
+        "event":       event_name,
+        "entity_type": entity_type,
+        "entity_id":   entity_id,
+        "timestamp":   datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "data":        data,
+    }
+    body     = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    sent_at  = datetime.now(timezone.utc).isoformat()
+    wc_cfg   = cfg.get("webhooks", {})
+    timeout  = int(wc_cfg.get("timeout_seconds", 10))
+
+    for ep in endpoints:
+        sig = _sign_webhook_body(body, ep["secret"])
+        try:
+            resp = requests.post(
+                ep["url"],
+                data=body,
+                headers={
+                    "Content-Type":    "application/json",
+                    "X-BDSK-Signature": sig,
+                    "X-BDSK-Event":    event_name,
+                },
+                timeout=timeout,
+            )
+            success     = resp.ok
+            http_status = resp.status_code
+            error       = None if success else f"HTTP {resp.status_code}: {resp.text[:120]}"
+        except Exception as exc:
+            success     = False
+            http_status = None
+            error       = str(exc)[:200]
+
+        status_str = "ok" if success else "fail"
+        print(f"[webhook] {ep['name']} {event_name} entity={entity_id} → {http_status or 'ERR'} ({status_str})")
+        _log_delivery(ep["id"], event_name, entity_id, sent_at, http_status, success, error)
+
+
 def run_event_sync(cfg: dict) -> None:
     print("=" * 60)
     print("Behdashtik Mirror Connector — Event Sync")
@@ -1300,6 +1559,8 @@ def run_event_sync(cfg: dict) -> None:
                 continue
 
             try:
+                effective_event  = event_type
+                snap_for_webhook = None
                 with conn.cursor() as cur:
                     if event_type == "deleted":
                         if entity_type == "order":
@@ -1311,11 +1572,13 @@ def run_event_sync(cfg: dict) -> None:
                         snap = api_get(cfg, f"/snapshot/{entity_type}/{entity_id}")
                         if not snap.get("exists"):
                             # Treat 404 snapshot as deleted (entity deleted between event capture and processing)
+                            effective_event = "deleted"
                             if entity_type == "order":
                                 _apply_order_delete(cur, entity_id)
                             else:
                                 _apply_product_delete(cur, entity_id)
                         else:
+                            snap_for_webhook = snap
                             if entity_type == "order":
                                 _apply_order_upsert(cur, snap)
                             else:
@@ -1323,7 +1586,12 @@ def run_event_sync(cfg: dict) -> None:
 
                 conn.commit()
                 ack_ids.extend(ev_ids_for_entity)
-                print(f"[events] OK       {entity_type}={entity_id} ({event_type})")
+                print(f"[events] OK       {entity_type}={entity_id} ({effective_event})")
+                # Best-effort webhook dispatch — delivery failure does not affect mirror correctness
+                try:
+                    _dispatch_webhooks(cfg, entity_type, entity_id, effective_event, snap_for_webhook)
+                except Exception as wh_exc:
+                    print(f"[webhook] dispatch error (non-fatal): {wh_exc}")
 
             except Exception as exc:
                 conn.rollback()

@@ -57,10 +57,6 @@ class BDSK_Export_Rest {
 					'sanitize_callback' => 'absint',
 					'validate_callback' => fn( $v ) => (int) $v >= 1 && (int) $v <= 999,
 				],
-				'token' => [
-					'required'          => true,
-					'sanitize_callback' => 'sanitize_text_field',
-				],
 			],
 		] );
 
@@ -177,7 +173,8 @@ class BDSK_Export_Rest {
 
 		$job_id = $request->get_param( 'job_id' );
 		$part   = (int) $request->get_param( 'part' );
-		$token  = $request->get_param( 'token' );
+		// Token is sent in X-BDSK-Download-Token header (not URL) to keep it out of nginx access logs.
+		$token  = sanitize_text_field( $request->get_header( 'X-BDSK-Download-Token' ) ?? '' );
 
 		if ( ! BDSK_Export_Job::validate_download_token( $job_id, $token ) ) {
 			return new WP_Error( 'invalid_token', 'Invalid or expired download token.', [ 'status' => 403 ] );

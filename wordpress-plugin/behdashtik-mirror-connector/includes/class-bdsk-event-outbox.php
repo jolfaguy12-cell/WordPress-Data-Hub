@@ -13,7 +13,6 @@ class BDSK_Event_Outbox {
 		// Order hooks (HPOS)
 		add_action( 'woocommerce_new_order',             [ __CLASS__, 'handle_order_upserted' ] );
 		add_action( 'woocommerce_update_order',          [ __CLASS__, 'handle_order_upserted' ] );
-		add_action( 'woocommerce_order_status_changed',  [ __CLASS__, 'handle_order_status_changed' ], 10, 4 );
 		add_action( 'woocommerce_trash_order',           [ __CLASS__, 'handle_order_deleted' ] );
 		add_action( 'woocommerce_untrash_order',         [ __CLASS__, 'handle_order_upserted' ] );
 		add_action( 'woocommerce_before_delete_order',   [ __CLASS__, 'handle_order_deleted' ] );
@@ -83,11 +82,6 @@ class BDSK_Event_Outbox {
 	// ---------------------------------------------------------------------------
 
 	public static function handle_order_upserted( int $order_id ): void {
-		self::enqueue( 'order', $order_id, 'upserted' );
-	}
-
-	// woocommerce_order_status_changed: ($order_id, $from_status, $to_status, $order)
-	public static function handle_order_status_changed( int $order_id ): void {
 		self::enqueue( 'order', $order_id, 'upserted' );
 	}
 
