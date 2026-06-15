@@ -32,6 +32,9 @@ class BDSK_Cleanup {
 
 		// Prune soft-deleted media index rows older than 30 days
 		BDSK_Media_Index::prune_old_deleted_rows();
+
+		// Prune acknowledged event outbox rows older than 7 days
+		BDSK_Event_Outbox::prune_old_acknowledged();
 	}
 
 	/**

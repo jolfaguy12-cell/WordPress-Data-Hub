@@ -23,6 +23,7 @@ class BDSK_Settings {
 		'index_unknown_media'    => false,
 		'include_evidence_images' => true,
 		'evidence_meta_keys'     => '',
+		'event_sync_enabled'     => true,
 		'last_successful_request' => '',
 		'last_failed_request'    => '',
 		'last_export_downloaded' => '',

@@ -63,6 +63,7 @@ class BDSK_Settings_Page {
 		add_settings_section( 'bdsk_main',     'Connection Settings', '__return_false', self::PAGE_SLUG );
 		add_settings_section( 'bdsk_security', 'Security',            '__return_false', self::PAGE_SLUG );
 		add_settings_section( 'bdsk_media',    'Media Manifest',      '__return_false', self::PAGE_SLUG );
+		add_settings_section( 'bdsk_events',   'Event Sync',          '__return_false', self::PAGE_SLUG );
 		add_settings_section( 'bdsk_debug',    'Development',         '__return_false', self::PAGE_SLUG );
 
 		$fields = [
@@ -76,6 +77,7 @@ class BDSK_Settings_Page {
 			[ 'include_evidence_images', 'Include Evidence Images',        'bdsk_media',    'checkbox', 'Index order evidence/receipt images. WARNING: may contain personal financial data — protect Server 2 storage accordingly.' ],
 			[ 'index_unknown_media',     'Index Unknown Media',            'bdsk_media',    'checkbox', 'Index attachments not linked to any product or order. Default OFF (avoids theme/logo clutter).' ],
 			[ 'evidence_meta_keys',      'Evidence Image Meta Keys',       'bdsk_media',    'text',     'Comma-separated order meta keys that hold WP attachment IDs for evidence images. Leave empty if not used.' ],
+			[ 'event_sync_enabled',      'Event Sync Enabled',             'bdsk_events',   'checkbox', 'Expose the <code>/events/pending</code>, <code>/events/ack</code>, and <code>/snapshot/*</code> endpoints and capture change events.' ],
 			[ 'debug_log_enabled',       'Enable Debug Log',               'bdsk_debug',    'checkbox', 'Writes to <code>wp-content/bdsk-debug.log</code>. Never enable in production.' ],
 		];
 
@@ -138,6 +140,7 @@ class BDSK_Settings_Page {
 			'include_evidence_images' => ! empty( $input['include_evidence_images'] ),
 			'index_unknown_media'    => ! empty( $input['index_unknown_media'] ),
 			'evidence_meta_keys'     => sanitize_text_field( $input['evidence_meta_keys'] ?? '' ),
+			'event_sync_enabled'     => ! empty( $input['event_sync_enabled'] ),
 			'debug_log_enabled'      => ! empty( $input['debug_log_enabled'] ),
 			// Legacy hash preserved — not written by the new generate flow
 			'api_key_hash'            => $existing['api_key_hash'],
@@ -455,6 +458,36 @@ class BDSK_Settings_Page {
 			<?php else : ?>
 			<p style="margin-top:12px"><em>Build in progress — refresh to check status.</em></p>
 			<?php endif; ?>
+
+			<hr />
+
+			<h2>Event Outbox</h2>
+
+			<?php
+			$ev_stats = BDSK_Event_Outbox::get_stats();
+			?>
+			<table class="form-table widefat" style="width:auto">
+				<tr>
+					<th>Pending</th>
+					<td><?php echo (int) $ev_stats['pending']; ?></td>
+				</tr>
+				<tr>
+					<th>Acknowledged</th>
+					<td><?php echo (int) $ev_stats['acknowledged']; ?></td>
+				</tr>
+				<tr>
+					<th>Expired</th>
+					<td><?php echo (int) $ev_stats['expired']; ?></td>
+				</tr>
+				<tr>
+					<th>Last Event Captured</th>
+					<td><?php echo esc_html( $ev_stats['last_event_at'] ?: '—' ); ?></td>
+				</tr>
+				<tr>
+					<th>Last Acknowledged</th>
+					<td><?php echo esc_html( $ev_stats['last_ack_at'] ?: '—' ); ?></td>
+				</tr>
+			</table>
 
 			<hr />
 

@@ -48,10 +48,12 @@ class BDSK_Health {
 			'read_mode_status'         => $settings['read_access_enabled'] ? 'on' : 'off',
 			'write_mode_status'        => 'off',
 			'backup_export_enabled'    => (bool) $settings['backup_export_enabled'],
-			'media_manifest_enabled'   => (bool) BDSK_Settings::get( 'media_manifest_enabled', true ),
-			'media_index_status'       => null === $media_status['last_full_build_at'] ? 'never_built' : $media_status['status'],
-			'media_index_last_built_at' => $media_status['last_full_build_at'],
-			'last_successful_request'  => $settings['last_successful_request'] ?: null,
+			'media_manifest_enabled'     => (bool) BDSK_Settings::get( 'media_manifest_enabled', true ),
+			'media_index_status'         => null === $media_status['last_full_build_at'] ? 'never_built' : $media_status['status'],
+			'media_index_last_built_at'  => $media_status['last_full_build_at'],
+			'event_sync_enabled'         => (bool) BDSK_Settings::get( 'event_sync_enabled', true ),
+			'event_outbox_pending_count' => (int) ( BDSK_Event_Outbox::get_stats()['pending'] ?? 0 ),
+			'last_successful_request'    => $settings['last_successful_request'] ?: null,
 		];
 	}
 }

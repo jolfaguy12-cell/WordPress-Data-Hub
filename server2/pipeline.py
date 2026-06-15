@@ -940,6 +940,432 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Event Sync — consumer pipeline
+# ---------------------------------------------------------------------------
+
+EVENT_SYNC_STATE_PATH = pathlib.Path(__file__).parent / "event_sync_state.json"
+
+EVENT_LOG_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS bdsk_event_log (
+    id                   BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    event_id             VARCHAR(36)     NOT NULL,
+    entity_type          VARCHAR(20)     NOT NULL,
+    entity_id            BIGINT UNSIGNED NOT NULL,
+    event_type           VARCHAR(20)     NOT NULL,
+    received_at          DATETIME        NOT NULL,
+    processed_at         DATETIME        NULL,
+    mirror_update_status VARCHAR(20)     NOT NULL DEFAULT 'ok',
+    error_message        TEXT            NULL,
+    PRIMARY KEY (id),
+    KEY event_id (event_id)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+"""
+
+
+def setup_event_log_table(cfg: dict) -> None:
+    with _media_conn(cfg) as conn:
+        with conn.cursor() as cur:
+            cur.execute(EVENT_LOG_TABLE_SQL)
+
+
+def _load_event_state() -> dict:
+    if EVENT_SYNC_STATE_PATH.exists():
+        try:
+            return json.loads(EVENT_SYNC_STATE_PATH.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_event_state(state: dict) -> None:
+    EVENT_SYNC_STATE_PATH.write_text(json.dumps(state))
+
+
+def _staging_db_exists(cfg: dict) -> bool:
+    """Returns True if the staging DB exists, indicating a Phase 1 import/swap is in progress."""
+    db = cfg["mirror_db"]
+    staging_name = db["name"] + "_staging"
+    conn = pymysql.connect(
+        host=db["host"],
+        port=db.get("port", 3306),
+        user=db["user"],
+        password=db["password"],
+        charset="utf8mb4",
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SHOW DATABASES LIKE %s", (staging_name,))
+            return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+# Mirror DB uses the same table prefix as WordPress (verbatim copy from Phase 1 export)
+_WP_PREFIX = "wp_"
+
+
+def _apply_order_delete(cur, order_id: int) -> None:
+    prefix = _WP_PREFIX
+    cur.execute(f"SELECT order_item_id FROM {prefix}woocommerce_order_items WHERE order_id = %s", (order_id,))
+    item_ids = [r[0] for r in cur.fetchall()]
+    if item_ids:
+        ph = ",".join(["%s"] * len(item_ids))
+        cur.execute(f"DELETE FROM {prefix}woocommerce_order_itemmeta WHERE order_item_id IN ({ph})", item_ids)
+    cur.execute(f"DELETE FROM {prefix}woocommerce_order_items WHERE order_id = %s", (order_id,))
+    cur.execute(f"DELETE FROM {prefix}wc_orders_meta WHERE order_id = %s", (order_id,))
+    cur.execute(f"DELETE FROM {prefix}wc_orders WHERE id = %s", (order_id,))
+
+
+def _apply_order_upsert(cur, snapshot: dict) -> None:
+    prefix = _WP_PREFIX
+    order_id = int(snapshot["order_id"])
+    order_row = snapshot["order_row"]
+
+    # Upsert main order row
+    cols = list(order_row.keys())
+    vals = [order_row[c] for c in cols]
+    col_sql  = ", ".join(f"`{c}`" for c in cols)
+    ph_sql   = ", ".join(["%s"] * len(cols))
+    upd_sql  = ", ".join(f"`{c}` = VALUES(`{c}`)" for c in cols if c != "id")
+    cur.execute(
+        f"INSERT INTO {prefix}wc_orders ({col_sql}) VALUES ({ph_sql}) "
+        f"ON DUPLICATE KEY UPDATE {upd_sql}",
+        vals,
+    )
+
+    # Replace meta: delete all then bulk insert
+    cur.execute(f"DELETE FROM {prefix}wc_orders_meta WHERE order_id = %s", (order_id,))
+    if snapshot["meta"]:
+        meta_ph = ", ".join(["(%s, %s, %s)"] * len(snapshot["meta"]))
+        meta_vals = []
+        for m in snapshot["meta"]:
+            meta_vals.extend([order_id, m["meta_key"], m["meta_value"]])
+        cur.execute(
+            f"INSERT INTO {prefix}wc_orders_meta (order_id, meta_key, meta_value) VALUES {meta_ph}",
+            meta_vals,
+        )
+
+    # Replace order items and itemmeta
+    cur.execute(f"SELECT order_item_id FROM {prefix}woocommerce_order_items WHERE order_id = %s", (order_id,))
+    existing_item_ids = [r[0] for r in cur.fetchall()]
+    if existing_item_ids:
+        ph = ",".join(["%s"] * len(existing_item_ids))
+        cur.execute(f"DELETE FROM {prefix}woocommerce_order_itemmeta WHERE order_item_id IN ({ph})", existing_item_ids)
+    cur.execute(f"DELETE FROM {prefix}woocommerce_order_items WHERE order_id = %s", (order_id,))
+
+    for item in snapshot.get("items", []):
+        item_row = item["item_row"]
+        icols = list(item_row.keys())
+        ivals = [item_row[c] for c in icols]
+        icol_sql = ", ".join(f"`{c}`" for c in icols)
+        iph_sql  = ", ".join(["%s"] * len(icols))
+        iupd_sql = ", ".join(f"`{c}` = VALUES(`{c}`)" for c in icols if c != "order_item_id")
+        cur.execute(
+            f"INSERT INTO {prefix}woocommerce_order_items ({icol_sql}) VALUES ({iph_sql}) "
+            f"ON DUPLICATE KEY UPDATE {iupd_sql}",
+            ivals,
+        )
+        new_item_id = int(item_row["order_item_id"])
+        if item.get("itemmeta"):
+            im_ph   = ", ".join(["(%s, %s, %s)"] * len(item["itemmeta"]))
+            im_vals = []
+            for im in item["itemmeta"]:
+                im_vals.extend([new_item_id, im["meta_key"], im["meta_value"]])
+            cur.execute(
+                f"INSERT INTO {prefix}woocommerce_order_itemmeta (order_item_id, meta_key, meta_value) VALUES {im_ph}",
+                im_vals,
+            )
+
+
+def _apply_product_delete(cur, product_id: int) -> None:
+    prefix = _WP_PREFIX
+    # Get variation IDs
+    cur.execute(
+        f"SELECT ID FROM {prefix}posts WHERE post_parent = %s AND post_type = 'product_variation'",
+        (product_id,),
+    )
+    var_ids = [r[0] for r in cur.fetchall()]
+
+    all_ids = [product_id] + var_ids
+    ph = ",".join(["%s"] * len(all_ids))
+
+    cur.execute(f"DELETE FROM {prefix}postmeta WHERE post_id IN ({ph})", all_ids)
+    cur.execute(f"DELETE FROM {prefix}wc_product_meta_lookup WHERE product_id IN ({ph})", all_ids)
+    cur.execute(f"DELETE FROM {prefix}term_relationships WHERE object_id = %s", (product_id,))
+    if var_ids:
+        var_ph = ",".join(["%s"] * len(var_ids))
+        cur.execute(f"DELETE FROM {prefix}posts WHERE ID IN ({var_ph})", var_ids)
+    cur.execute(f"DELETE FROM {prefix}posts WHERE ID = %s", (product_id,))
+
+
+def _apply_product_upsert(cur, snapshot: dict) -> None:
+    prefix = _WP_PREFIX
+    product_id = int(snapshot["product_id"])
+    post_row = snapshot["post_row"]
+
+    # Upsert main post row
+    cols = list(post_row.keys())
+    vals = [post_row[c] for c in cols]
+    col_sql = ", ".join(f"`{c}`" for c in cols)
+    ph_sql  = ", ".join(["%s"] * len(cols))
+    upd_sql = ", ".join(f"`{c}` = VALUES(`{c}`)" for c in cols if c != "ID")
+    cur.execute(
+        f"INSERT INTO {prefix}posts ({col_sql}) VALUES ({ph_sql}) "
+        f"ON DUPLICATE KEY UPDATE {upd_sql}",
+        vals,
+    )
+
+    # Replace postmeta
+    cur.execute(f"DELETE FROM {prefix}postmeta WHERE post_id = %s", (product_id,))
+    if snapshot["meta"]:
+        m_ph   = ", ".join(["(%s, %s, %s)"] * len(snapshot["meta"]))
+        m_vals = []
+        for m in snapshot["meta"]:
+            m_vals.extend([product_id, m["meta_key"], m["meta_value"]])
+        cur.execute(
+            f"INSERT INTO {prefix}postmeta (post_id, meta_key, meta_value) VALUES {m_ph}",
+            m_vals,
+        )
+
+    # Replace term_relationships
+    cur.execute(f"DELETE FROM {prefix}term_relationships WHERE object_id = %s", (product_id,))
+    tr_rows = []
+    for term_group in snapshot.get("terms", []):
+        taxonomy = term_group["taxonomy"]
+        for term_id in term_group["term_ids"]:
+            # Look up term_taxonomy_id in mirror DB
+            cur.execute(
+                f"SELECT term_taxonomy_id FROM {prefix}term_taxonomy "
+                f"WHERE taxonomy = %s AND term_id = %s LIMIT 1",
+                (taxonomy, term_id),
+            )
+            row = cur.fetchone()
+            if row:
+                tr_rows.append((product_id, row[0]))
+    if tr_rows:
+        tr_ph = ", ".join(["(%s, %s)"] * len(tr_rows))
+        tr_vals = [v for pair in tr_rows for v in pair]
+        cur.execute(
+            f"INSERT IGNORE INTO {prefix}term_relationships (object_id, term_taxonomy_id) VALUES {tr_ph}",
+            tr_vals,
+        )
+
+    # Upsert product lookup row
+    if snapshot.get("lookup_row"):
+        lr = snapshot["lookup_row"]
+        lr_cols = list(lr.keys())
+        lr_vals = [lr[c] for c in lr_cols]
+        lr_col_sql = ", ".join(f"`{c}`" for c in lr_cols)
+        lr_ph_sql  = ", ".join(["%s"] * len(lr_cols))
+        lr_upd_sql = ", ".join(f"`{c}` = VALUES(`{c}`)" for c in lr_cols if c != "product_id")
+        cur.execute(
+            f"INSERT INTO {prefix}wc_product_meta_lookup ({lr_col_sql}) VALUES ({lr_ph_sql}) "
+            f"ON DUPLICATE KEY UPDATE {lr_upd_sql}",
+            lr_vals,
+        )
+
+    # Handle variations
+    snapshot_var_ids = []
+    for var in snapshot.get("variations", []):
+        vp = var["post_row"]
+        var_id = int(vp["ID"])
+        snapshot_var_ids.append(var_id)
+
+        # Upsert variation post row
+        vcols = list(vp.keys())
+        vvals = [vp[c] for c in vcols]
+        vcol_sql = ", ".join(f"`{c}`" for c in vcols)
+        vph_sql  = ", ".join(["%s"] * len(vcols))
+        vupd_sql = ", ".join(f"`{c}` = VALUES(`{c}`)" for c in vcols if c != "ID")
+        cur.execute(
+            f"INSERT INTO {prefix}posts ({vcol_sql}) VALUES ({vph_sql}) "
+            f"ON DUPLICATE KEY UPDATE {vupd_sql}",
+            vvals,
+        )
+
+        # Replace variation postmeta
+        cur.execute(f"DELETE FROM {prefix}postmeta WHERE post_id = %s", (var_id,))
+        if var.get("meta"):
+            vm_ph   = ", ".join(["(%s, %s, %s)"] * len(var["meta"]))
+            vm_vals = []
+            for m in var["meta"]:
+                vm_vals.extend([var_id, m["meta_key"], m["meta_value"]])
+            cur.execute(
+                f"INSERT INTO {prefix}postmeta (post_id, meta_key, meta_value) VALUES {vm_ph}",
+                vm_vals,
+            )
+
+        # Upsert variation lookup row
+        if var.get("lookup_row"):
+            vlr = var["lookup_row"]
+            vlr_cols = list(vlr.keys())
+            vlr_vals = [vlr[c] for c in vlr_cols]
+            vlr_col_sql = ", ".join(f"`{c}`" for c in vlr_cols)
+            vlr_ph_sql  = ", ".join(["%s"] * len(vlr_cols))
+            vlr_upd_sql = ", ".join(f"`{c}` = VALUES(`{c}`)" for c in vlr_cols if c != "product_id")
+            cur.execute(
+                f"INSERT INTO {prefix}wc_product_meta_lookup ({vlr_col_sql}) VALUES ({vlr_ph_sql}) "
+                f"ON DUPLICATE KEY UPDATE {vlr_upd_sql}",
+                vlr_vals,
+            )
+
+    # Delete orphan variations (in mirror but not in snapshot)
+    if snapshot_var_ids:
+        excl_ph = ",".join(["%s"] * len(snapshot_var_ids))
+        cur.execute(
+            f"SELECT ID FROM {prefix}posts "
+            f"WHERE post_parent = %s AND post_type = 'product_variation' AND ID NOT IN ({excl_ph})",
+            [product_id] + snapshot_var_ids,
+        )
+        orphan_ids = [r[0] for r in cur.fetchall()]
+    else:
+        cur.execute(
+            f"SELECT ID FROM {prefix}posts WHERE post_parent = %s AND post_type = 'product_variation'",
+            (product_id,),
+        )
+        orphan_ids = [r[0] for r in cur.fetchall()]
+
+    if orphan_ids:
+        oph = ",".join(["%s"] * len(orphan_ids))
+        cur.execute(f"DELETE FROM {prefix}postmeta WHERE post_id IN ({oph})", orphan_ids)
+        cur.execute(f"DELETE FROM {prefix}wc_product_meta_lookup WHERE product_id IN ({oph})", orphan_ids)
+        cur.execute(f"DELETE FROM {prefix}posts WHERE ID IN ({oph})", orphan_ids)
+
+
+def run_event_sync(cfg: dict) -> None:
+    print("=" * 60)
+    print("Behdashtik Mirror Connector — Event Sync")
+    print(f"Time: {datetime.now(timezone.utc).isoformat()}")
+    print("=" * 60)
+
+    setup_event_log_table(cfg)
+
+    # Check for in-progress staging-DB swap (Phase 1)
+    if _staging_db_exists(cfg):
+        print("[events] Staging DB swap in progress — skipping this cycle.")
+        return
+
+    state    = _load_event_state()
+    after_id = int(state.get("after_id", 0))
+    batch    = int(cfg.get("event_sync", {}).get("batch_size", 200))
+    max_retry = int(cfg.get("event_sync", {}).get("max_retries", 10))
+
+    data   = api_get(cfg, "/events/pending", {"after_id": after_id, "limit": batch})
+    events = data.get("items", [])
+
+    if not events:
+        print("[events] No pending events.")
+        return
+
+    print(f"[events] {len(events)} pending event(s) since id={after_id}.")
+
+    # Deduplicate: group by (entity_type, entity_id), keep last event_type per entity
+    seen: dict[tuple, dict] = {}
+    for ev in events:
+        key = (ev["entity_type"], int(ev["entity_id"]))
+        seen[key] = ev  # last event wins
+
+    received_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    ack_ids: list[str] = []
+    all_event_ids_for_entity: dict[tuple, list[str]] = {}
+    for ev in events:
+        key = (ev["entity_type"], int(ev["entity_id"]))
+        all_event_ids_for_entity.setdefault(key, []).append(ev["event_id"])
+
+    log_rows: list[dict] = []
+
+    with _media_conn(cfg) as conn:
+        conn.autocommit(False)
+        for (entity_type, entity_id), ev in seen.items():
+            event_type = ev["event_type"]
+            ev_ids_for_entity = all_event_ids_for_entity[(entity_type, entity_id)]
+
+            status      = "ok"
+            error_msg   = None
+            processed_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+            # Check retry cap: use retry_count from the representative event
+            retry_count = int(ev.get("retry_count", 0))
+            if retry_count >= max_retry:
+                print(f"[events] EXPIRED  {entity_type}={entity_id} after {retry_count} retries — skipping.")
+                status = "expired"
+                # Still ack so it moves to acknowledged; Server 2 consumer logs it as expired
+                ack_ids.extend(ev_ids_for_entity)
+                log_rows.append({
+                    "event_id": ev["event_id"], "entity_type": entity_type,
+                    "entity_id": entity_id, "event_type": event_type,
+                    "received_at": received_at, "processed_at": processed_at,
+                    "mirror_update_status": "expired", "error_message": f"retry_count={retry_count}",
+                })
+                continue
+
+            try:
+                with conn.cursor() as cur:
+                    if event_type == "deleted":
+                        if entity_type == "order":
+                            _apply_order_delete(cur, entity_id)
+                        else:
+                            _apply_product_delete(cur, entity_id)
+                    else:
+                        # upserted — fetch current snapshot
+                        snap = api_get(cfg, f"/snapshot/{entity_type}/{entity_id}")
+                        if not snap.get("exists"):
+                            # Treat 404 snapshot as deleted (entity deleted between event capture and processing)
+                            if entity_type == "order":
+                                _apply_order_delete(cur, entity_id)
+                            else:
+                                _apply_product_delete(cur, entity_id)
+                        else:
+                            if entity_type == "order":
+                                _apply_order_upsert(cur, snap)
+                            else:
+                                _apply_product_upsert(cur, snap)
+
+                conn.commit()
+                ack_ids.extend(ev_ids_for_entity)
+                print(f"[events] OK       {entity_type}={entity_id} ({event_type})")
+
+            except Exception as exc:
+                conn.rollback()
+                status    = "failed"
+                error_msg = str(exc)
+                print(f"[events] FAIL     {entity_type}={entity_id} ({event_type}): {error_msg[:120]}")
+
+            log_rows.append({
+                "event_id": ev["event_id"], "entity_type": entity_type,
+                "entity_id": entity_id, "event_type": event_type,
+                "received_at": received_at, "processed_at": processed_at,
+                "mirror_update_status": status, "error_message": error_msg,
+            })
+
+    # Write event log rows
+    if log_rows:
+        with _media_conn(cfg) as conn:
+            with conn.cursor() as cur:
+                for lr in log_rows:
+                    cur.execute(
+                        """INSERT INTO bdsk_event_log
+                           (event_id, entity_type, entity_id, event_type,
+                            received_at, processed_at, mirror_update_status, error_message)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (lr["event_id"], lr["entity_type"], lr["entity_id"],
+                         lr["event_type"], lr["received_at"], lr["processed_at"],
+                         lr["mirror_update_status"], lr["error_message"]),
+                    )
+
+    # Ack successfully processed events
+    if ack_ids:
+        api_post(cfg, "/events/ack", {"event_ids": ack_ids})
+        print(f"[events] Acknowledged {len(ack_ids)} event(s).")
+
+    # Advance cursor to max id seen in this batch
+    max_id = max(int(ev["id"]) for ev in events)
+    _save_event_state({"after_id": max_id})
+    print(f"[events] Cursor advanced to after_id={max_id}.")
+    print("[events] Event sync complete.")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -951,6 +1377,7 @@ if __name__ == "__main__":
     parser.add_argument("--prune",           action="store_true", help="Prune expired local archives and exit")
     parser.add_argument("--media-sync",      action="store_true", help="Run incremental media file sync")
     parser.add_argument("--media-sync-full", action="store_true", help="Run full media file sync (ignores last_sync_at)")
+    parser.add_argument("--event-sync",      action="store_true", help="Run event sync (apply pending order/product changes to mirror)")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -966,6 +1393,8 @@ if __name__ == "__main__":
             run_media_sync(cfg, full=True)
         elif args.media_sync:
             run_media_sync(cfg, full=False)
+        elif args.event_sync:
+            run_event_sync(cfg)
         else:
             run_pipeline(cfg, test_mode=args.test)
     except (RuntimeError, TimeoutError, FileNotFoundError) as exc:

@@ -24,6 +24,11 @@ class BDSK_DB {
 		return $wpdb->prefix . 'bdsk_media_index';
 	}
 
+	public static function event_outbox_table(): string {
+		global $wpdb;
+		return $wpdb->prefix . 'bdsk_event_outbox';
+	}
+
 	// ---------------------------------------------------------------------------
 	// Activation: create custom tables
 	// ---------------------------------------------------------------------------
@@ -99,9 +104,29 @@ class BDSK_DB {
 			KEY status (status)
 		) $charset;";
 
+		$outbox_sql = "CREATE TABLE " . self::event_outbox_table() . " (
+			id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+			event_id         VARCHAR(36)     NOT NULL,
+			entity_type      VARCHAR(20)     NOT NULL,
+			entity_id        BIGINT UNSIGNED NOT NULL,
+			event_type       VARCHAR(20)     NOT NULL,
+			changed_at       DATETIME        NOT NULL,
+			status           VARCHAR(20)     NOT NULL DEFAULT 'pending',
+			retry_count      INT             NOT NULL DEFAULT 0,
+			last_error       TEXT                     DEFAULT NULL,
+			created_at       DATETIME        NOT NULL,
+			sent_at          DATETIME                 DEFAULT NULL,
+			acknowledged_at  DATETIME                 DEFAULT NULL,
+			PRIMARY KEY  (id),
+			UNIQUE KEY event_id (event_id),
+			KEY status_id (status, id),
+			KEY entity_lookup (entity_type, entity_id, event_type, status)
+		) $charset;";
+
 		dbDelta( $jobs_sql );
 		dbDelta( $log_sql );
 		dbDelta( $media_sql );
+		dbDelta( $outbox_sql );
 	}
 
 	// ---------------------------------------------------------------------------
