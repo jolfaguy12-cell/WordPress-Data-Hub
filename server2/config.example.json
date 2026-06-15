@@ -14,5 +14,9 @@
   },
   "poll_interval_seconds": 5,
   "poll_timeout_seconds": 3600,
-  "request_timeout_seconds": 60
+  "request_timeout_seconds": 60,
+  "hub": {
+    "secret_key": "generate-with: python3 -c \"import secrets; print(secrets.token_hex(32))\"",
+    "session_lifetime_hours": 12
+  }
 }
