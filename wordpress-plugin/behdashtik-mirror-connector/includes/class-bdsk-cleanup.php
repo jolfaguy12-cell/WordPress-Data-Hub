@@ -25,16 +25,32 @@ class BDSK_Cleanup {
 	// ---------------------------------------------------------------------------
 
 	public static function run_cleanup(): void {
+		global $wpdb;
+
+		$summary = [
+			'export_files_cleaned'    => 0,
+			'media_rows_pruned'       => 0,
+			'event_rows_pruned'       => 0,
+			'request_log_rows_pruned' => 0,
+		];
+
 		$jobs = BDSK_DB::get_jobs_for_cleanup();
 		foreach ( $jobs as $job ) {
 			self::cleanup_job( $job['job_id'] );
+			$summary['export_files_cleaned']++;
 		}
 
-		// Prune soft-deleted media index rows older than 30 days
-		BDSK_Media_Index::prune_old_deleted_rows();
+		$summary['media_rows_pruned'] = BDSK_Media_Index::prune_old_deleted_rows();
 
-		// Prune acknowledged event outbox rows older than 7 days
-		BDSK_Event_Outbox::prune_old_acknowledged();
+		$summary['event_rows_pruned'] = BDSK_Event_Outbox::prune_old_acknowledged();
+
+		// Prune request log rows older than 30 days
+		$summary['request_log_rows_pruned'] = (int) $wpdb->query(
+			"DELETE FROM " . BDSK_DB::log_table() .
+			" WHERE created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 30 DAY)"
+		);
+
+		BDSK_Stats::save_cleanup_status( $summary );
 	}
 
 	/**

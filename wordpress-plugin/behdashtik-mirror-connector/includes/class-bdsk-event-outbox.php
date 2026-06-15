@@ -267,12 +267,13 @@ class BDSK_Event_Outbox {
 	// Cleanup: prune old acknowledged events
 	// ---------------------------------------------------------------------------
 
-	public static function prune_old_acknowledged(): void {
+	public static function prune_old_acknowledged(): int {
 		global $wpdb;
-		$wpdb->query(
+		$deleted = $wpdb->query(
 			"DELETE FROM " . BDSK_DB::event_outbox_table() . "
 			 WHERE status = 'acknowledged'
 			 AND acknowledged_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)"
 		);
+		return (int) $deleted;
 	}
 }

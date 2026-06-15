@@ -1366,6 +1366,153 @@ def run_event_sync(cfg: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Status command — read-only system overview
+# ---------------------------------------------------------------------------
+
+def get_status_data(cfg: dict) -> dict:
+    """Gather all status information from WP health endpoint + local state."""
+    health = api_get(cfg, "/health")
+
+    # Mirror DB: latest export job
+    latest_job = None
+    try:
+        with _media_conn(cfg) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT job_id, status, created_at, finished_at FROM bdsk_local_media_index LIMIT 0"
+                )
+    except Exception:
+        pass
+
+    try:
+        with _media_conn(cfg) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT job_id, status, created_at, finished_at "
+                    "FROM wp_bdsk_export_jobs ORDER BY id DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+                if row:
+                    latest_job = {
+                        "job_id":      row[0][:8] + "…" if row[0] else None,
+                        "status":      row[1],
+                        "created_at":  str(row[2]) if row[2] else None,
+                        "finished_at": str(row[3]) if row[3] else None,
+                    }
+    except Exception:
+        pass
+
+    # Mirror DB: media index counts by status
+    media_counts: dict = {}
+    try:
+        with _media_conn(cfg) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT status, COUNT(*) FROM bdsk_local_media_index GROUP BY status"
+                )
+                for s, cnt in cur.fetchall():
+                    media_counts[s] = cnt
+    except Exception:
+        pass
+
+    # Local state files
+    media_state     = _load_sync_state()
+    event_state     = _load_event_state()
+    event_state_mtime = None
+    if EVENT_SYNC_STATE_PATH.exists():
+        import os
+        event_state_mtime = datetime.fromtimestamp(
+            os.path.getmtime(EVENT_SYNC_STATE_PATH), tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M UTC")
+
+    # Count local archive directories
+    archive_base = pathlib.Path(cfg.get("archive_storage_path", ""))
+    archive_count = len([d for d in archive_base.iterdir() if d.is_dir()]) if archive_base.exists() else 0
+
+    # Count local media files on disk
+    media_base  = pathlib.Path(cfg.get("media_sync", {}).get("storage_path", ""))
+    media_files = 0
+    if media_base.exists():
+        media_files = sum(1 for _ in media_base.rglob("*") if _.is_file())
+
+    last_sync_ts = media_state.get("last_sync_at")
+    last_sync_str = (
+        datetime.fromtimestamp(last_sync_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        if last_sync_ts else "never"
+    )
+
+    return {
+        "health":         health,
+        "latest_job":     latest_job,
+        "media_counts":   media_counts,
+        "media_files":    media_files,
+        "archive_count":  archive_count,
+        "archive_base":   str(archive_base),
+        "last_sync_at":   last_sync_str,
+        "event_after_id": event_state.get("after_id", 0),
+        "event_last_run": event_state_mtime,
+    }
+
+
+def run_status(cfg: dict) -> None:
+    """Print a human-readable system status overview. Read-only, no mutations."""
+    d = get_status_data(cfg)
+    h = d["health"]
+
+    print("=" * 60)
+    print("Behdashtik Mirror Connector — Status")
+    print("=" * 60)
+
+    # WordPress / plugin
+    conn_status = "connected"
+    last_req    = h.get("last_successful_request") or h.get("last_successful_at")
+    if not last_req:
+        conn_status = "never connected"
+    elif h.get("last_connection_status") == "stale":
+        conn_status = "stale"
+
+    print(f"\nWordPress: {'OK' if h.get('status') == 'ok' else 'ERROR'}")
+    print(f"  Plugin v{h.get('plugin_version')} | WP {h.get('wordpress_version')} | "
+          f"WC {h.get('woocommerce_version') or 'N/A'} | PHP {h.get('php_version')}")
+    print(f"  Connector: {'enabled' if h.get('connector_enabled') else 'DISABLED'} | "
+          f"Read access: {h.get('read_mode_status', 'off')} | Write access: off")
+    print(f"  Last successful request: {last_req or '—'} ({conn_status})")
+    if h.get("last_cleanup_run"):
+        print(f"  Last cleanup run: {h['last_cleanup_run']}")
+
+    # DB mirror
+    job = d["latest_job"]
+    print(f"\nDB Mirror ({cfg['mirror_db']['name']}):")
+    if job:
+        print(f"  Last export job: {job['job_id']} — {job['status']}")
+        print(f"  Created: {job['created_at'] or '—'} | Finished: {job['finished_at'] or '—'}")
+    else:
+        print("  No export jobs found in mirror DB.")
+    print(f"  Archives on disk: {d['archive_count']} ({d['archive_base']})")
+
+    # Media
+    mc = d["media_counts"]
+    print(f"\nMedia:")
+    print(f"  Index: {h.get('media_index_status', 'unknown')}")
+    if mc:
+        active  = mc.get("downloaded", 0) + mc.get("active", 0)
+        pending = mc.get("pending", 0) + mc.get("queued", 0)
+        print(f"  Local index: {active} downloaded, {pending} pending, "
+              f"{mc.get('failed', 0)} failed")
+    print(f"  Local files on disk: {d['media_files']}")
+    print(f"  Last sync: {d['last_sync_at']}")
+
+    # Events
+    pending_ev = h.get("event_outbox_pending_count", 0)
+    print(f"\nEvents:")
+    print(f"  Pending on WP: {pending_ev}")
+    print(f"  Last processed id (cursor): {d['event_after_id']}")
+    print(f"  Last event-sync run: {d['event_last_run'] or 'never'}")
+
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1378,6 +1525,7 @@ if __name__ == "__main__":
     parser.add_argument("--media-sync",      action="store_true", help="Run incremental media file sync")
     parser.add_argument("--media-sync-full", action="store_true", help="Run full media file sync (ignores last_sync_at)")
     parser.add_argument("--event-sync",      action="store_true", help="Run event sync (apply pending order/product changes to mirror)")
+    parser.add_argument("--status",          action="store_true", help="Show system status overview (read-only)")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -1395,6 +1543,8 @@ if __name__ == "__main__":
             run_media_sync(cfg, full=False)
         elif args.event_sync:
             run_event_sync(cfg)
+        elif args.status:
+            run_status(cfg)
         else:
             run_pipeline(cfg, test_mode=args.test)
     except (RuntimeError, TimeoutError, FileNotFoundError) as exc:

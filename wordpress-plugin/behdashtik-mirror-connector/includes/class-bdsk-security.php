@@ -12,21 +12,21 @@ class BDSK_Settings {
 	private const OPTION_KEY = 'bdsk_settings';
 
 	private static array $defaults = [
-		'enabled'                => false,
-		'read_access_enabled'    => false,
-		'backup_export_enabled'  => false,
-		'allowed_ips'            => '',
-		'disable_ip_check'       => false,
-		'api_key_hash'           => '',   // legacy: hash-only fallback (no longer written by new UI)
-		'debug_log_enabled'      => false,
-		'media_manifest_enabled' => true,
-		'index_unknown_media'    => false,
-		'include_evidence_images' => true,
-		'evidence_meta_keys'     => '',
-		'event_sync_enabled'     => true,
-		'last_successful_request' => '',
-		'last_failed_request'    => '',
-		'last_export_downloaded' => '',
+		'enabled'                    => false,
+		'read_access_enabled'        => false,
+		'backup_export_enabled'      => false,
+		'allowed_ips'                => '',
+		'disable_ip_check'           => false,
+		'api_key_hash'               => '',   // legacy: hash-only fallback
+		'debug_log_enabled'          => false,
+		'media_manifest_enabled'     => true,
+		'index_unknown_media'        => false,
+		'include_evidence_images'    => true,
+		'evidence_meta_keys'         => '',
+		'event_sync_enabled'         => true,
+		'rate_limit_enabled'         => true,
+		'rate_limit_max_failures'    => 10,
+		'rate_limit_window_minutes'  => 15,
 	];
 
 	public static function get( string $key, mixed $default = null ): mixed {
@@ -66,20 +66,10 @@ class BDSK_Security {
 	// Encryption helpers (private)
 	// -----------------------------------------------------------------------
 
-	/**
-	 * Derives a 32-byte AES key from this site's auth salt.
-	 * Deterministic per installation — no extra configuration required.
-	 */
 	private static function derive_enc_key(): string {
-		// HMAC rather than plain hash so the domain separation string ('|bdsk|v1')
-		// cannot be pre-imaged against the salt even if sha256 weaknesses emerge.
 		return hash_hmac( 'sha256', 'bdsk|v1', wp_salt( 'auth' ), true );
 	}
 
-	/**
-	 * Encrypts a plaintext secret string with AES-256-CBC and a random IV.
-	 * Returns a base64-encoded blob: IV[16] || ciphertext.
-	 */
 	private static function encrypt_secret( string $plaintext ): string {
 		$key        = self::derive_enc_key();
 		$iv         = openssl_random_pseudo_bytes( 16 );
@@ -87,11 +77,6 @@ class BDSK_Security {
 		return base64_encode( $iv . $ciphertext );
 	}
 
-	/**
-	 * Decrypts a blob produced by encrypt_secret().
-	 * Returns the plaintext string, or false if decryption fails
-	 * (e.g. wp_salt was rotated after the key was stored).
-	 */
 	private static function decrypt_secret( string $blob ): string|false {
 		$raw = base64_decode( $blob, true );
 		if ( false === $raw || strlen( $raw ) <= 16 ) {
@@ -108,14 +93,6 @@ class BDSK_Security {
 	// API secret — public interface
 	// -----------------------------------------------------------------------
 
-	/**
-	 * Returns the plaintext API secret from whichever source is active.
-	 *
-	 * Priority:
-	 *   1. BDSK_API_SECRET PHP constant (backward compat — no DB read).
-	 *   2. AES-256-CBC encrypted option 'bdsk_api_secret_enc'.
-	 *   3. null — no secret configured.
-	 */
 	public static function get_api_secret(): ?string {
 		if ( defined( 'BDSK_API_SECRET' ) && '' !== BDSK_API_SECRET ) {
 			return BDSK_API_SECRET;
@@ -127,16 +104,11 @@ class BDSK_Security {
 			if ( false !== $plaintext ) {
 				return $plaintext;
 			}
-			// Decryption failed — salt was probably rotated; treat as unconfigured.
 		}
 
 		return null;
 	}
 
-	/**
-	 * Returns true if any secret source is configured
-	 * (constant, encrypted option, or legacy hash).
-	 */
 	public static function has_secret(): bool {
 		if ( defined( 'BDSK_API_SECRET' ) && '' !== BDSK_API_SECRET ) {
 			return true;
@@ -144,28 +116,20 @@ class BDSK_Security {
 		if ( '' !== get_option( self::ENC_OPTION, '' ) ) {
 			return true;
 		}
-		// Legacy hash-only fallback counts as "has secret" for API auth
 		if ( '' !== BDSK_Settings::get( 'api_key_hash', '' ) ) {
 			return true;
 		}
 		return false;
 	}
 
-	/** Returns true when the PHP constant takes priority over the stored secret. */
 	public static function using_constant(): bool {
 		return defined( 'BDSK_API_SECRET' ) && '' !== BDSK_API_SECRET;
 	}
 
-	/** Returns true when the encrypted-at-rest option is the active source. */
 	public static function using_encrypted_option(): bool {
 		return ! self::using_constant() && '' !== get_option( self::ENC_OPTION, '' );
 	}
 
-	/**
-	 * Generates a cryptographically random 32-byte secret (hex-encoded = 64 chars),
-	 * encrypts it, stores it, and returns the plaintext for one-time display.
-	 * Safe to call for both initial generation and regeneration.
-	 */
 	public static function generate_and_store(): string {
 		$plaintext = bin2hex( openssl_random_pseudo_bytes( 32 ) );
 		$blob      = self::encrypt_secret( $plaintext );
@@ -177,20 +141,15 @@ class BDSK_Security {
 	// API key validation
 	// -----------------------------------------------------------------------
 
-	/**
-	 * Constant-time key comparison supporting all three secret sources.
-	 */
 	public static function validate_api_key( string $provided_key ): bool {
 		if ( '' === $provided_key ) {
 			return false;
 		}
 
-		// 1. PHP constant (backward compat)
 		if ( self::using_constant() ) {
 			return hash_equals( BDSK_API_SECRET, $provided_key );
 		}
 
-		// 2. Encrypted-at-rest: compare decrypted plaintext against provided key
 		$blob = get_option( self::ENC_OPTION, '' );
 		if ( '' !== $blob ) {
 			$plaintext = self::decrypt_secret( $blob );
@@ -199,7 +158,6 @@ class BDSK_Security {
 			}
 		}
 
-		// 3. Legacy hash-only fallback (old installs that set api_key_hash manually)
 		$stored_hash = BDSK_Settings::get( 'api_key_hash', '' );
 		if ( '' !== $stored_hash ) {
 			return hash_equals( $stored_hash, hash( 'sha256', $provided_key ) );
@@ -212,14 +170,6 @@ class BDSK_Security {
 	// IP validation
 	// -----------------------------------------------------------------------
 
-	/**
-	 * Returns the requester's IP.
-	 *
-	 * Note: X-Forwarded-For is checked only as a fallback when REMOTE_ADDR is
-	 * missing or empty. XFF is spoofable unless your reverse proxy is configured
-	 * to overwrite (not append) it — enable "disable_ip_check" in local dev if
-	 * your proxy setup makes this unreliable.
-	 */
 	public static function get_request_ip( WP_REST_Request $request ): string {
 		// phpcs:ignore WordPress.Security.ValidatedSanitizedInput
 		$remote = $_SERVER['REMOTE_ADDR'] ?? '';
@@ -228,7 +178,6 @@ class BDSK_Security {
 			return sanitize_text_field( $remote );
 		}
 
-		// Fallback: first IP in X-Forwarded-For (may be set by load balancer / Cloudflare)
 		$xff = $request->get_header( 'X-Forwarded-For' );
 		if ( $xff ) {
 			$parts = explode( ',', $xff );
@@ -245,7 +194,7 @@ class BDSK_Security {
 
 		$allowed_raw = BDSK_Settings::get( 'allowed_ips', '' );
 		if ( '' === $allowed_raw ) {
-			return false; // no IPs configured = deny all
+			return false;
 		}
 
 		$allowed = array_filter( array_map( 'trim', explode( ',', $allowed_raw ) ) );
@@ -263,22 +212,33 @@ class BDSK_Security {
 	// Main request validation middleware
 	// -----------------------------------------------------------------------
 
-	/**
-	 * Returns true on success, WP_Error on failure.
-	 * Logs every request (accepted and rejected) to bdsk_request_log.
-	 */
 	public static function validate_request( WP_REST_Request $request ): true|WP_Error {
 		$start    = microtime( true );
 		$endpoint = $request->get_route();
 		$ip       = self::get_request_ip( $request );
+		$ip_hash  = hash( 'sha256', $ip );
+		$fail_key = 'bdsk_authfail_' . $ip_hash;
 
-		$reject = static function ( string $reason ) use ( $endpoint, $ip, $start ): WP_Error {
+		$reject = static function ( string $reason, int $http_status = 403 ) use ( $endpoint, $ip, $start ): WP_Error {
 			$duration_ms = (int) round( ( microtime( true ) - $start ) * 1000 );
 			BDSK_DB::log_request( $endpoint, $ip, 'rejected', $reason, $duration_ms );
-			BDSK_Settings::set( 'last_failed_request', current_time( 'mysql', true ) );
+			BDSK_Stats::increment( $endpoint, 'rejected', $reason );
 			bdsk_log( "Request rejected: {$reason}", [ 'endpoint' => $endpoint, 'ip' => $ip ] );
-			return new WP_Error( $reason, 'Request rejected.', [ 'status' => 403 ] );
+			return new WP_Error( $reason, 'Request rejected.', [ 'status' => $http_status ] );
 		};
+
+		// Rate limit — check before anything else to bail cheaply on brute-force
+		if ( BDSK_Settings::get( 'rate_limit_enabled', true ) ) {
+			$max_failures = (int) BDSK_Settings::get( 'rate_limit_max_failures', 10 );
+			$fail_count   = (int) ( get_transient( $fail_key ) ?: 0 );
+			if ( $fail_count >= $max_failures ) {
+				$duration_ms = (int) round( ( microtime( true ) - $start ) * 1000 );
+				BDSK_DB::log_request( $endpoint, $ip, 'rejected', 'rate_limited', $duration_ms );
+				BDSK_Stats::increment( $endpoint, 'rejected', 'rate_limited' );
+				bdsk_log( "Rate limited: {$ip}", [ 'endpoint' => $endpoint, 'fail_count' => $fail_count ] );
+				return new WP_Error( 'rate_limited', 'Too many authentication failures.', [ 'status' => 429 ] );
+			}
+		}
 
 		// 1. Connector enabled?
 		if ( ! BDSK_Settings::get( 'enabled' ) ) {
@@ -290,10 +250,9 @@ class BDSK_Security {
 			return $reject( 'read_access_disabled' );
 		}
 
-		// 3. Authorization header — Bearer token
+		// 3. Authorization header — Bearer token (also accepts X-BDSK-Key)
 		$auth = $request->get_header( 'Authorization' );
 		if ( ! $auth ) {
-			// Also accept X-BDSK-Key for simpler clients
 			$auth = $request->get_header( 'X-BDSK-Key' );
 			$key  = $auth ? trim( $auth ) : '';
 		} else {
@@ -301,6 +260,10 @@ class BDSK_Security {
 		}
 
 		if ( '' === $key || ! self::validate_api_key( $key ) ) {
+			// Increment fail counter; counter persists for the configured window
+			$window     = (int) BDSK_Settings::get( 'rate_limit_window_minutes', 15 );
+			$fail_count = (int) ( get_transient( $fail_key ) ?: 0 );
+			set_transient( $fail_key, $fail_count + 1, $window * 60 );
 			return $reject( 'bad_key' );
 		}
 
@@ -309,10 +272,11 @@ class BDSK_Security {
 			return $reject( 'ip_mismatch' );
 		}
 
-		// 5. Log accepted request
+		// Success — reset fail counter and log
+		delete_transient( $fail_key );
 		$duration_ms = (int) round( ( microtime( true ) - $start ) * 1000 );
 		BDSK_DB::log_request( $endpoint, $ip, 'accepted', null, $duration_ms );
-		BDSK_Settings::set( 'last_successful_request', current_time( 'mysql', true ) );
+		BDSK_Stats::increment( $endpoint, 'accepted' );
 
 		return true;
 	}

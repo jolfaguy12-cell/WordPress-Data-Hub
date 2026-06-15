@@ -53,7 +53,8 @@ class BDSK_Health {
 			'media_index_last_built_at'  => $media_status['last_full_build_at'],
 			'event_sync_enabled'         => (bool) BDSK_Settings::get( 'event_sync_enabled', true ),
 			'event_outbox_pending_count' => (int) ( BDSK_Event_Outbox::get_stats()['pending'] ?? 0 ),
-			'last_successful_request'    => $settings['last_successful_request'] ?: null,
+			'last_successful_request'    => BDSK_Stats::get_totals()['last_successful_at'] ?? null,
+			'last_cleanup_run'           => BDSK_Stats::get_cleanup_status()['last_run_at'] ?? null,
 		];
 	}
 }

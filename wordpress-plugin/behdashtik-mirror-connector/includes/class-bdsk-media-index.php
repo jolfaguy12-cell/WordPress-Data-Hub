@@ -585,14 +585,15 @@ class BDSK_Media_Index {
 	// Cleanup: prune soft-deleted rows older than 30 days
 	// ---------------------------------------------------------------------------
 
-	public static function prune_old_deleted_rows(): void {
+	public static function prune_old_deleted_rows(): int {
 		global $wpdb;
 
-		$wpdb->query( $wpdb->prepare(
+		$deleted = $wpdb->query( $wpdb->prepare(
 			"DELETE FROM " . BDSK_DB::media_index_table() . "
 			 WHERE status = 'deleted' AND index_updated_at < DATE_SUB(%s, INTERVAL 30 DAY)",
 			current_time( 'mysql', true )
 		) );
+		return (int) $deleted;
 	}
 
 	// ---------------------------------------------------------------------------
