@@ -10,7 +10,7 @@ Usage:
   python pipeline.py                    # full pipeline
   python pipeline.py --health-only      # health check only
   python pipeline.py --test             # test export (50 rows per table)
-  python pipeline.py --import-only /datahub/db-archives/<job_id>
+  python pipeline.py --import-only /root/wordpress-data-hub/data/db-archives/<job_id>
 """
 
 import argparse
@@ -770,14 +770,15 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
         print("[media] Media sync disabled in config.")
         return
 
-    media_base    = pathlib.Path(media_cfg.get("storage_path", "/tmp/bdsk-media"))
+    media_base    = pathlib.Path(media_cfg.get("storage_path", "/root/wordpress-data-hub/data/media"))
     concurrency   = int(media_cfg.get("concurrency", 4))
     max_file_size = int(media_cfg.get("max_file_size_bytes", 52_428_800))  # 50 MB
     page_limit    = 200
 
     media_base.mkdir(parents=True, exist_ok=True)
+    media_base.chmod(0o700)  # restrict: no other users/processes should read this
 
-    # Protect the directory (deny web access)
+    # Deny web access if ever accidentally served
     htaccess = media_base / ".htaccess"
     if not htaccess.exists():
         htaccess.write_text("Deny from all\n")
