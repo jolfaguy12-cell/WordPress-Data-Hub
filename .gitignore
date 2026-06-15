@@ -2,8 +2,6 @@
 server2/config.json
 server2/media_sync_state.json
 server2/event_sync_state.json
-server2/.htpasswd
-server2/.dashboard-password
 server2/hub.db
 
 # Runtime data — contains DB dumps (customer password hashes) and media files
