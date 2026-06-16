@@ -613,6 +613,7 @@ def _media_conn(cfg: dict):
         database=db["name"],
         charset="utf8mb4",
         autocommit=True,
+        init_command="SET sql_mode=''",  # allow zero dates mirrored from WordPress
     )
 
 
