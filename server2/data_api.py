@@ -916,6 +916,60 @@ def changed_orders():
 # HEALTH
 # ---------------------------------------------------------------------------
 
+@data_api.get("/mapping/basalam/<int:basalam_product_id>")
+@require_api_key
+def mapping_basalam_single(basalam_product_id: int):
+    """Return the WooCommerce product ID for a given Basalam product ID."""
+    vendor_id = request.args.get("vendor_id", "1399163")
+    meta_key = f"sync_basalam_product_id_{vendor_id}"
+    try:
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT p.ID
+                       FROM wp_posts p
+                       INNER JOIN wp_postmeta pm ON p.ID = pm.post_id
+                       WHERE pm.meta_key = %s AND pm.meta_value = %s
+                         AND p.post_status = 'publish'
+                       LIMIT 1""",
+                    (meta_key, str(basalam_product_id)),
+                )
+                row = cur.fetchone()
+        if not row:
+            return _err("not_found", "No mapping found for this Basalam product ID", 404)
+        return _ok({"basalam_product_id": basalam_product_id, "wc_product_id": row["ID"]})
+    except Exception as e:
+        return _err("db_error", str(e), 500)
+
+
+@data_api.get("/mapping/basalam")
+@require_api_key
+def mapping_basalam_all():
+    """Return all Basalam → WooCommerce product ID mappings."""
+    vendor_id = request.args.get("vendor_id", "1399163")
+    meta_key = f"sync_basalam_product_id_{vendor_id}"
+    try:
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT pm.meta_value AS basalam_product_id, p.ID AS wc_product_id
+                       FROM wp_posts p
+                       INNER JOIN wp_postmeta pm ON p.ID = pm.post_id
+                       WHERE pm.meta_key = %s AND pm.meta_value != ''
+                         AND p.post_status = 'publish'
+                       ORDER BY p.ID""",
+                    (meta_key,),
+                )
+                rows = cur.fetchall()
+        mappings = [
+            {"basalam_product_id": int(r["basalam_product_id"]), "wc_product_id": r["wc_product_id"]}
+            for r in rows
+        ]
+        return _ok({"vendor_id": vendor_id, "count": len(mappings), "mappings": mappings})
+    except Exception as e:
+        return _err("db_error", str(e), 500)
+
+
 @data_api.get("/health")
 @require_api_key
 def api_health():
