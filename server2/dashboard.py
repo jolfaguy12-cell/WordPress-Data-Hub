@@ -14,6 +14,7 @@ import getpass
 import hashlib
 import hmac
 import json
+import os
 import pathlib
 import secrets
 import sqlite3
@@ -27,6 +28,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import jinja2
 from flask import (Flask, Response, flash, redirect, render_template,
                    request, session, url_for)
+from data_api import data_api as data_api_bp
 from pipeline import get_status_data, load_config
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -269,6 +271,7 @@ def _reset_fail(ip: str) -> None:
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
+app.register_blueprint(data_api_bp)
 
 
 def _init_app() -> None:
@@ -281,6 +284,11 @@ def _init_app() -> None:
     app.secret_key = key
     lifetime_h = int(hub.get("session_lifetime_hours", 12))
     app.permanent_session_lifetime = timedelta(hours=lifetime_h)
+    app.config["PIPELINE_CFG"] = cfg
+    app.config["DATA_API_KEY"] = (
+        cfg.get("data_api", {}).get("key", "")
+        or os.environ.get("BDSK_DATA_API_KEY", "")
+    )
     init_db()
     if count_users() == 0:
         sys.exit(

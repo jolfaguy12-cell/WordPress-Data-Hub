@@ -1,0 +1,964 @@
+"""
+Behdashtik Data Hub — Read-Only REST API  (Blueprint: /api/v1)
+
+All endpoints require the header:  X-Hub-API-Key: <key>
+Key is read from config.json → data_api.key  or env var BDSK_DATA_API_KEY.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from functools import wraps
+
+import pymysql
+import pymysql.cursors
+from flask import Blueprint, current_app, jsonify, request
+
+API_VERSION = "1.0.0"
+data_api = Blueprint("data_api", __name__, url_prefix="/api/v1")
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+def _configured_key() -> str:
+    return (
+        os.environ.get("BDSK_DATA_API_KEY")
+        or current_app.config.get("DATA_API_KEY", "")
+    )
+
+
+def require_api_key(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        key = request.headers.get("X-Hub-API-Key", "")
+        cfg_key = _configured_key()
+        if not cfg_key:
+            return _err("not_configured", "Data API key is not configured on the server.", 503)
+        if not key or key != cfg_key:
+            return _err("unauthorized", "Invalid or missing X-Hub-API-Key header.", 401)
+        return f(*args, **kwargs)
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# DB / config helpers
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def _db():
+    cfg = current_app.config["PIPELINE_CFG"]
+    db = cfg["mirror_db"]
+    conn = pymysql.connect(
+        host=db["host"],
+        port=db.get("port", 3306),
+        user=db.get("readonly_user", db["user"]),
+        password=db.get("readonly_password", db["password"]),
+        database=db["name"],
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        init_command="SET sql_mode=''",
+    )
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _media_base() -> pathlib.Path:
+    cfg = current_app.config["PIPELINE_CFG"]
+    p = cfg.get("media_sync", {}).get("storage_path", "")
+    return pathlib.Path(p) if p else pathlib.Path(__file__).parent.parent / "data" / "media"
+
+
+def _wp_uploads_url() -> str:
+    cfg = current_app.config["PIPELINE_CFG"]
+    return cfg.get("wp_base_url", "").rstrip("/") + "/wp-content/uploads"
+
+
+# ---------------------------------------------------------------------------
+# Response helpers
+# ---------------------------------------------------------------------------
+
+def _ok(data, **extra):
+    resp = {"data": data}
+    resp.update(extra)
+    return jsonify(resp)
+
+
+def _err(code: str, message: str, status: int = 400):
+    return jsonify({"error": code, "message": message}), status
+
+
+def _paginate(total: int, page: int, per_page: int) -> dict:
+    return {
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "pages": max(1, (total + per_page - 1) // per_page),
+    }
+
+
+def _page_params() -> tuple[int, int]:
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+    except (TypeError, ValueError):
+        per_page = 20
+    return page, per_page
+
+
+def _dt(val) -> str | None:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.isoformat()
+    s = str(val)
+    return None if s.startswith("0000") else s
+
+
+def _int(val) -> int | None:
+    try:
+        return int(val) if val is not None and val != "" else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _float(val) -> float | None:
+    try:
+        return float(val) if val is not None and val != "" else None
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Internal: product helpers
+# ---------------------------------------------------------------------------
+
+def _meta_dict(cur, post_id: int) -> dict:
+    cur.execute("SELECT meta_key, meta_value FROM wp_postmeta WHERE post_id = %s", (post_id,))
+    return {r["meta_key"]: r["meta_value"] for r in cur.fetchall()}
+
+
+def _terms_by_taxonomy(cur, post_id: int) -> dict:
+    cur.execute(
+        """SELECT tt.taxonomy, t.term_id, t.name, t.slug
+           FROM wp_term_relationships tr
+           JOIN wp_term_taxonomy tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+           JOIN wp_terms t ON tt.term_id = t.term_id
+           WHERE tr.object_id = %s""",
+        (post_id,),
+    )
+    result: dict[str, list] = {}
+    for r in cur.fetchall():
+        result.setdefault(r["taxonomy"], []).append(
+            {"id": r["term_id"], "name": r["name"], "slug": r["slug"]}
+        )
+    return result
+
+
+def _lookup_row(cur, product_id: int) -> dict:
+    cur.execute(
+        "SELECT * FROM wp_wc_product_meta_lookup WHERE product_id = %s", (product_id,)
+    )
+    return cur.fetchone() or {}
+
+
+def _attachment_image(cur, att_id: int) -> dict | None:
+    if not att_id:
+        return None
+    cur.execute(
+        "SELECT ID, post_title, guid FROM wp_posts WHERE ID = %s AND post_type = 'attachment'",
+        (att_id,),
+    )
+    post = cur.fetchone()
+    if not post:
+        return None
+    cur.execute(
+        "SELECT meta_value FROM wp_postmeta WHERE post_id = %s AND meta_key = '_wp_attached_file'",
+        (att_id,),
+    )
+    row = cur.fetchone()
+    rel_path = row["meta_value"] if row else None
+    media_base = _media_base()
+    uploads_url = _wp_uploads_url()
+    local_file = (media_base / rel_path) if rel_path else None
+    return {
+        "id": post["ID"],
+        "title": post["post_title"],
+        "url": f"{uploads_url}/{rel_path}" if rel_path else post["guid"],
+        "local_path": str(local_file) if local_file and local_file.exists() else None,
+        "file": rel_path,
+    }
+
+
+def _product_images(cur, post_id: int, meta: dict) -> list:
+    ids: list[int] = []
+    thumb_id = _int(meta.get("_thumbnail_id"))
+    if thumb_id:
+        ids.append(thumb_id)
+    for gid in (meta.get("_product_image_gallery") or "").split(","):
+        gid = gid.strip()
+        n = _int(gid)
+        if n and n not in ids:
+            ids.append(n)
+
+    images = []
+    for i, aid in enumerate(ids):
+        img = _attachment_image(cur, aid)
+        if img:
+            img["position"] = i
+            img["is_thumbnail"] = aid == thumb_id
+            images.append(img)
+    return images
+
+
+def _build_product(post: dict, meta: dict, terms: dict, lookup: dict, *,
+                   full: bool = False, cur=None) -> dict:
+    obj: dict = {
+        "id": post["ID"],
+        "name": post.get("post_title"),
+        "slug": post.get("post_name"),
+        "status": post.get("post_status"),
+        "type": "variable" if post.get("post_type") == "product" and meta.get("_product_type") == "variable" else post.get("post_type"),
+        "parent_id": _int(post.get("post_parent")) or None,
+        "date_created": _dt(post.get("post_date")),
+        "date_modified": _dt(post.get("post_modified")),
+        "sku": lookup.get("sku") or meta.get("_sku"),
+        "global_unique_id": lookup.get("global_unique_id") or meta.get("_global_unique_id"),
+        "price": _float(lookup.get("min_price") or meta.get("_price")),
+        "regular_price": _float(meta.get("_regular_price")),
+        "sale_price": _float(meta.get("_sale_price")) if meta.get("_sale_price") else None,
+        "on_sale": bool(lookup.get("onsale")),
+        "stock_quantity": _float(lookup.get("stock_quantity") or meta.get("_stock")),
+        "stock_status": lookup.get("stock_status") or meta.get("_stock_status"),
+        "manage_stock": meta.get("_manage_stock") == "yes",
+        "backorders": meta.get("_backorders"),
+        "virtual": bool(lookup.get("virtual")) or meta.get("_virtual") == "yes",
+        "downloadable": bool(lookup.get("downloadable")) or meta.get("_downloadable") == "yes",
+        "tax_status": lookup.get("tax_status") or meta.get("_tax_status"),
+        "tax_class": lookup.get("tax_class") or meta.get("_tax_class"),
+        "average_rating": _float(lookup.get("average_rating") or meta.get("_wc_average_rating")),
+        "review_count": _int(lookup.get("rating_count") or meta.get("_wc_review_count")),
+        "total_sales": _int(lookup.get("total_sales") or meta.get("total_sales")),
+        "categories": terms.get("product_cat", []),
+        "brands": terms.get("product_brand", []),
+        "tags": terms.get("product_tag", []),
+    }
+
+    if full and cur is not None:
+        obj["description"] = post.get("post_content") or None
+        obj["short_description"] = post.get("post_excerpt") or None
+        obj["images"] = _product_images(cur, post["ID"], meta)
+        obj["seo"] = {
+            "title": meta.get("rank_math_title"),
+            "description": meta.get("rank_math_description"),
+            "focus_keyword": meta.get("rank_math_focus_keyword"),
+            "score": _int(meta.get("rank_math_seo_score")),
+        }
+        obj["raw_attributes"] = meta.get("_product_attributes")
+
+        cur.execute(
+            "SELECT * FROM wp_posts WHERE post_parent = %s AND post_type = 'product_variation' ORDER BY menu_order",
+            (post["ID"],),
+        )
+        variations = []
+        for vp in cur.fetchall():
+            vmeta = _meta_dict(cur, vp["ID"])
+            vlookup = _lookup_row(cur, vp["ID"])
+            variations.append(_build_variation(vp, vmeta, vlookup))
+        obj["variations"] = variations
+
+    return obj
+
+
+def _build_variation(post: dict, meta: dict, lookup: dict) -> dict:
+    return {
+        "id": post["ID"],
+        "parent_id": _int(post.get("post_parent")),
+        "status": post.get("post_status"),
+        "date_created": _dt(post.get("post_date")),
+        "date_modified": _dt(post.get("post_modified")),
+        "sku": lookup.get("sku") or meta.get("_sku"),
+        "price": _float(lookup.get("min_price") or meta.get("_price")),
+        "regular_price": _float(meta.get("_regular_price")),
+        "sale_price": _float(meta.get("_sale_price")) if meta.get("_sale_price") else None,
+        "on_sale": bool(lookup.get("onsale")),
+        "stock_quantity": _float(lookup.get("stock_quantity") or meta.get("_stock")),
+        "stock_status": lookup.get("stock_status") or meta.get("_stock_status"),
+        "manage_stock": meta.get("_manage_stock") == "yes",
+        "virtual": bool(lookup.get("virtual")) or meta.get("_virtual") == "yes",
+        "downloadable": bool(lookup.get("downloadable")) or meta.get("_downloadable") == "yes",
+        "raw_attributes": meta.get("_product_attributes"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Internal: order helpers
+# ---------------------------------------------------------------------------
+
+def _order_meta(cur, order_id: int) -> dict:
+    cur.execute(
+        "SELECT meta_key, meta_value FROM wp_wc_orders_meta WHERE order_id = %s", (order_id,)
+    )
+    return {r["meta_key"]: r["meta_value"] for r in cur.fetchall()}
+
+
+def _order_items(cur, order_id: int) -> list:
+    cur.execute(
+        "SELECT order_item_id, order_item_name, order_item_type FROM wp_woocommerce_order_items WHERE order_id = %s",
+        (order_id,),
+    )
+    items = cur.fetchall()
+    result = []
+    for item in items:
+        cur.execute(
+            "SELECT meta_key, meta_value FROM wp_woocommerce_order_itemmeta WHERE order_item_id = %s",
+            (item["order_item_id"],),
+        )
+        im = {r["meta_key"]: r["meta_value"] for r in cur.fetchall()}
+        entry: dict = {
+            "id": item["order_item_id"],
+            "name": item["order_item_name"],
+            "type": item["order_item_type"],
+        }
+        if item["order_item_type"] == "line_item":
+            entry.update({
+                "product_id": _int(im.get("_product_id")),
+                "variation_id": _int(im.get("_variation_id")) or None,
+                "quantity": _float(im.get("_qty")),
+                "subtotal": _float(im.get("_line_subtotal")),
+                "total": _float(im.get("_line_total")),
+                "subtotal_tax": _float(im.get("_line_subtotal_tax")),
+                "total_tax": _float(im.get("_line_tax")),
+                "tax_class": im.get("_tax_class"),
+            })
+        elif item["order_item_type"] == "shipping":
+            entry.update({
+                "method_id": im.get("method_id"),
+                "method_title": im.get("method_title") or item["order_item_name"],
+                "total": _float(im.get("cost")),
+                "total_tax": _float(im.get("taxes")),
+            })
+        elif item["order_item_type"] == "fee":
+            entry.update({
+                "total": _float(im.get("line_total")),
+                "tax_class": im.get("tax_class"),
+                "tax_status": im.get("tax_status"),
+                "total_tax": _float(im.get("line_tax")),
+            })
+        result.append(entry)
+    return result
+
+
+def _build_address(meta: dict, prefix: str) -> dict:
+    return {k: meta.get(f"_{prefix}_{k}") for k in (
+        "first_name", "last_name", "company",
+        "address_1", "address_2", "city", "state",
+        "postcode", "country", "phone", "email",
+    )}
+
+
+def _build_order(order: dict, meta: dict, items: list) -> dict:
+    status = order.get("status", "")
+    if status.startswith("wc-"):
+        status = status[3:]
+    return {
+        "id": order["id"],
+        "status": status,
+        "currency": order.get("currency"),
+        "date_created": _dt(order.get("date_created_gmt")),
+        "date_modified": _dt(order.get("date_updated_gmt")),
+        "total": _float(order.get("total_amount")),
+        "tax_total": _float(order.get("tax_amount")),
+        "customer_id": _int(order.get("customer_id")),
+        "customer_note": order.get("customer_note"),
+        "billing_email": order.get("billing_email"),
+        "payment_method": order.get("payment_method"),
+        "payment_method_title": order.get("payment_method_title"),
+        "transaction_id": order.get("transaction_id"),
+        "parent_order_id": _int(order.get("parent_order_id")) or None,
+        "billing": _build_address(meta, "billing"),
+        "shipping": _build_address(meta, "shipping"),
+        "line_items": [i for i in items if i["type"] == "line_item"],
+        "shipping_lines": [i for i in items if i["type"] == "shipping"],
+        "fee_lines": [i for i in items if i["type"] == "fee"],
+        "meta": {
+            k: v for k, v in meta.items()
+            if not k.startswith(("_billing_", "_shipping_"))
+            and k not in ("_billing_address_index", "_shipping_address_index")
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# PRODUCTS
+# ---------------------------------------------------------------------------
+
+@data_api.get("/products")
+@require_api_key
+def list_products():
+    page, per_page = _page_params()
+    offset = (page - 1) * per_page
+
+    status = request.args.get("status")
+    stock_status = request.args.get("stock_status")
+    category_id = request.args.get("category_id", type=int)
+    brand_id = request.args.get("brand_id", type=int)
+    search = request.args.get("search", "").strip()
+    modified_since = request.args.get("modified_since")
+    sort_by = request.args.get("sort_by", "id")
+    sort_dir = "ASC" if request.args.get("sort_dir", "desc").lower() == "asc" else "DESC"
+
+    sort_col = {
+        "id": "p.ID", "date": "p.post_date", "modified": "p.post_modified",
+        "name": "p.post_title", "price": "l.min_price", "sales": "l.total_sales",
+    }.get(sort_by, "p.ID")
+
+    where = ["p.post_type = 'product'", "p.post_status != 'auto-draft'"]
+    params: list = []
+
+    if status:
+        where.append("p.post_status = %s")
+        params.append(status)
+    if stock_status:
+        where.append("l.stock_status = %s")
+        params.append(stock_status)
+    if search:
+        where.append("(p.post_title LIKE %s OR l.sku LIKE %s OR l.global_unique_id LIKE %s)")
+        params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+    if modified_since:
+        where.append("p.post_modified >= %s")
+        params.append(modified_since)
+    if category_id:
+        where.append("""p.ID IN (
+            SELECT tr.object_id FROM wp_term_relationships tr
+            JOIN wp_term_taxonomy tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+            WHERE tt.taxonomy = 'product_cat' AND tt.term_id = %s)""")
+        params.append(category_id)
+    if brand_id:
+        where.append("""p.ID IN (
+            SELECT tr.object_id FROM wp_term_relationships tr
+            JOIN wp_term_taxonomy tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+            WHERE tt.taxonomy = 'product_brand' AND tt.term_id = %s)""")
+        params.append(brand_id)
+
+    where_sql = " AND ".join(where)
+
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT COUNT(*) as cnt FROM wp_posts p "
+                f"LEFT JOIN wp_wc_product_meta_lookup l ON l.product_id = p.ID "
+                f"WHERE {where_sql}",
+                params,
+            )
+            total = cur.fetchone()["cnt"]
+            cur.execute(
+                f"""SELECT p.ID, p.post_title, p.post_name, p.post_status, p.post_type,
+                           p.post_date, p.post_modified,
+                           l.sku, l.global_unique_id, l.min_price, l.max_price,
+                           l.stock_quantity, l.stock_status, l.onsale,
+                           l.average_rating, l.rating_count, l.total_sales
+                    FROM wp_posts p
+                    LEFT JOIN wp_wc_product_meta_lookup l ON l.product_id = p.ID
+                    WHERE {where_sql}
+                    ORDER BY {sort_col} {sort_dir}
+                    LIMIT %s OFFSET %s""",
+                params + [per_page, offset],
+            )
+            rows = cur.fetchall()
+            products = []
+            for r in rows:
+                terms = _terms_by_taxonomy(cur, r["ID"])
+                products.append({
+                    "id": r["ID"],
+                    "name": r["post_title"],
+                    "slug": r["post_name"],
+                    "status": r["post_status"],
+                    "sku": r["sku"],
+                    "global_unique_id": r["global_unique_id"],
+                    "price": _float(r["min_price"]),
+                    "max_price": _float(r["max_price"]),
+                    "on_sale": bool(r["onsale"]),
+                    "stock_quantity": _float(r["stock_quantity"]),
+                    "stock_status": r["stock_status"],
+                    "average_rating": _float(r["average_rating"]),
+                    "total_sales": _int(r["total_sales"]),
+                    "date_created": _dt(r["post_date"]),
+                    "date_modified": _dt(r["post_modified"]),
+                    "categories": terms.get("product_cat", []),
+                    "brands": terms.get("product_brand", []),
+                })
+
+    return _ok(products, pagination=_paginate(total, page, per_page))
+
+
+@data_api.get("/products/<int:pid>")
+@require_api_key
+def get_product(pid):
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM wp_posts WHERE ID = %s AND post_type = 'product'", (pid,))
+            post = cur.fetchone()
+            if not post:
+                return _err("not_found", f"Product {pid} not found.", 404)
+            meta = _meta_dict(cur, pid)
+            terms = _terms_by_taxonomy(cur, pid)
+            lookup = _lookup_row(cur, pid)
+            product = _build_product(post, meta, terms, lookup, full=True, cur=cur)
+    return _ok(product)
+
+
+@data_api.get("/products/<int:pid>/variations")
+@require_api_key
+def get_product_variations(pid):
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ID FROM wp_posts WHERE ID = %s AND post_type = 'product'", (pid,))
+            if not cur.fetchone():
+                return _err("not_found", f"Product {pid} not found.", 404)
+            cur.execute(
+                "SELECT * FROM wp_posts WHERE post_parent = %s AND post_type = 'product_variation' ORDER BY menu_order",
+                (pid,),
+            )
+            variations = []
+            for vp in cur.fetchall():
+                vmeta = _meta_dict(cur, vp["ID"])
+                vlookup = _lookup_row(cur, vp["ID"])
+                variations.append(_build_variation(vp, vmeta, vlookup))
+    return _ok(variations)
+
+
+@data_api.get("/products/<int:pid>/images")
+@require_api_key
+def get_product_images(pid):
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ID FROM wp_posts WHERE ID = %s AND post_type = 'product'", (pid,))
+            if not cur.fetchone():
+                return _err("not_found", f"Product {pid} not found.", 404)
+            meta = _meta_dict(cur, pid)
+            images = _product_images(cur, pid, meta)
+    return _ok(images)
+
+
+# ---------------------------------------------------------------------------
+# CATEGORIES
+# ---------------------------------------------------------------------------
+
+@data_api.get("/categories")
+@require_api_key
+def list_categories():
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT t.term_id as id, t.name, t.slug, tt.parent, tt.count
+                FROM wp_terms t
+                JOIN wp_term_taxonomy tt ON t.term_id = tt.term_id
+                WHERE tt.taxonomy = 'product_cat'
+                ORDER BY tt.parent ASC, t.name ASC
+            """)
+            cats = [dict(r) for r in cur.fetchall()]
+    return _ok(cats)
+
+
+@data_api.get("/categories/tree")
+@require_api_key
+def categories_tree():
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT t.term_id as id, t.name, t.slug, tt.parent, tt.count
+                FROM wp_terms t
+                JOIN wp_term_taxonomy tt ON t.term_id = tt.term_id
+                WHERE tt.taxonomy = 'product_cat'
+                ORDER BY tt.parent ASC, t.name ASC
+            """)
+            cats = [dict(r) for r in cur.fetchall()]
+
+    by_id = {c["id"]: {**c, "children": []} for c in cats}
+    roots = []
+    for c in by_id.values():
+        if c["parent"] == 0:
+            roots.append(c)
+        elif c["parent"] in by_id:
+            by_id[c["parent"]]["children"].append(c)
+    return _ok(roots)
+
+
+@data_api.get("/categories/<int:cid>")
+@require_api_key
+def get_category(cid):
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT t.term_id as id, t.name, t.slug, tt.parent, tt.count
+                FROM wp_terms t
+                JOIN wp_term_taxonomy tt ON t.term_id = tt.term_id
+                WHERE tt.taxonomy = 'product_cat' AND t.term_id = %s
+            """, (cid,))
+            cat = cur.fetchone()
+            if not cat:
+                return _err("not_found", f"Category {cid} not found.", 404)
+            cat = dict(cat)
+            ancestors = []
+            parent_id = cat["parent"]
+            while parent_id:
+                cur.execute("""
+                    SELECT t.term_id as id, t.name, t.slug, tt.parent
+                    FROM wp_terms t JOIN wp_term_taxonomy tt ON t.term_id = tt.term_id
+                    WHERE tt.taxonomy = 'product_cat' AND t.term_id = %s
+                """, (parent_id,))
+                anc = cur.fetchone()
+                if not anc:
+                    break
+                ancestors.insert(0, {"id": anc["id"], "name": anc["name"], "slug": anc["slug"]})
+                parent_id = anc["parent"]
+            cat["ancestors"] = ancestors
+    return _ok(cat)
+
+
+@data_api.get("/categories/<int:cid>/products")
+@require_api_key
+def category_products(cid):
+    page, per_page = _page_params()
+    offset = (page - 1) * per_page
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT t.term_id FROM wp_terms t JOIN wp_term_taxonomy tt ON t.term_id=tt.term_id
+                WHERE tt.taxonomy='product_cat' AND t.term_id=%s""", (cid,))
+            if not cur.fetchone():
+                return _err("not_found", f"Category {cid} not found.", 404)
+            cur.execute("""SELECT COUNT(*) as cnt
+                FROM wp_posts p
+                JOIN wp_term_relationships tr ON p.ID = tr.object_id
+                JOIN wp_term_taxonomy tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+                WHERE tt.taxonomy='product_cat' AND tt.term_id=%s
+                  AND p.post_type='product' AND p.post_status != 'auto-draft'""", (cid,))
+            total = cur.fetchone()["cnt"]
+            cur.execute("""
+                SELECT p.ID, p.post_title, p.post_name, p.post_status,
+                       p.post_date, p.post_modified,
+                       l.sku, l.min_price, l.stock_quantity, l.stock_status, l.onsale
+                FROM wp_posts p
+                JOIN wp_term_relationships tr ON p.ID = tr.object_id
+                JOIN wp_term_taxonomy tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+                LEFT JOIN wp_wc_product_meta_lookup l ON l.product_id = p.ID
+                WHERE tt.taxonomy='product_cat' AND tt.term_id=%s
+                  AND p.post_type='product' AND p.post_status != 'auto-draft'
+                ORDER BY p.ID DESC LIMIT %s OFFSET %s
+            """, (cid, per_page, offset))
+            products = [_product_row_summary(r) for r in cur.fetchall()]
+    return _ok(products, pagination=_paginate(total, page, per_page))
+
+
+# ---------------------------------------------------------------------------
+# BRANDS
+# ---------------------------------------------------------------------------
+
+@data_api.get("/brands")
+@require_api_key
+def list_brands():
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT t.term_id as id, t.name, t.slug, tt.count
+                FROM wp_terms t
+                JOIN wp_term_taxonomy tt ON t.term_id = tt.term_id
+                WHERE tt.taxonomy = 'product_brand'
+                ORDER BY t.name ASC
+            """)
+            brands = [dict(r) for r in cur.fetchall()]
+    return _ok(brands)
+
+
+@data_api.get("/brands/<int:bid>")
+@require_api_key
+def get_brand(bid):
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT t.term_id as id, t.name, t.slug, tt.count
+                FROM wp_terms t
+                JOIN wp_term_taxonomy tt ON t.term_id = tt.term_id
+                WHERE tt.taxonomy='product_brand' AND t.term_id=%s
+            """, (bid,))
+            brand = cur.fetchone()
+            if not brand:
+                return _err("not_found", f"Brand {bid} not found.", 404)
+            brand = dict(brand)
+            cur.execute("SELECT meta_key, meta_value FROM wp_termmeta WHERE term_id=%s", (bid,))
+            brand["meta"] = {r["meta_key"]: r["meta_value"] for r in cur.fetchall()}
+    return _ok(brand)
+
+
+@data_api.get("/brands/<int:bid>/products")
+@require_api_key
+def brand_products(bid):
+    page, per_page = _page_params()
+    offset = (page - 1) * per_page
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT t.term_id FROM wp_terms t JOIN wp_term_taxonomy tt ON t.term_id=tt.term_id
+                WHERE tt.taxonomy='product_brand' AND t.term_id=%s""", (bid,))
+            if not cur.fetchone():
+                return _err("not_found", f"Brand {bid} not found.", 404)
+            cur.execute("""SELECT COUNT(*) as cnt
+                FROM wp_posts p
+                JOIN wp_term_relationships tr ON p.ID = tr.object_id
+                JOIN wp_term_taxonomy tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+                WHERE tt.taxonomy='product_brand' AND tt.term_id=%s
+                  AND p.post_type='product' AND p.post_status != 'auto-draft'""", (bid,))
+            total = cur.fetchone()["cnt"]
+            cur.execute("""
+                SELECT p.ID, p.post_title, p.post_name, p.post_status,
+                       p.post_date, p.post_modified,
+                       l.sku, l.min_price, l.stock_quantity, l.stock_status, l.onsale
+                FROM wp_posts p
+                JOIN wp_term_relationships tr ON p.ID = tr.object_id
+                JOIN wp_term_taxonomy tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+                LEFT JOIN wp_wc_product_meta_lookup l ON l.product_id = p.ID
+                WHERE tt.taxonomy='product_brand' AND tt.term_id=%s
+                  AND p.post_type='product' AND p.post_status != 'auto-draft'
+                ORDER BY p.ID DESC LIMIT %s OFFSET %s
+            """, (bid, per_page, offset))
+            products = [_product_row_summary(r) for r in cur.fetchall()]
+    return _ok(products, pagination=_paginate(total, page, per_page))
+
+
+# ---------------------------------------------------------------------------
+# ORDERS
+# ---------------------------------------------------------------------------
+
+@data_api.get("/orders")
+@require_api_key
+def list_orders():
+    page, per_page = _page_params()
+    offset = (page - 1) * per_page
+
+    status = request.args.get("status")
+    customer_id = request.args.get("customer_id", type=int)
+    date_after = request.args.get("date_after")
+    date_before = request.args.get("date_before")
+
+    where = ["o.type = 'shop_order'"]
+    params: list = []
+    if status:
+        s = status if status.startswith("wc-") else f"wc-{status}"
+        where.append("o.status = %s")
+        params.append(s)
+    if customer_id:
+        where.append("o.customer_id = %s")
+        params.append(customer_id)
+    if date_after:
+        where.append("o.date_created_gmt >= %s")
+        params.append(date_after)
+    if date_before:
+        where.append("o.date_created_gmt <= %s")
+        params.append(date_before)
+
+    where_sql = " AND ".join(where)
+
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) as cnt FROM wp_wc_orders o WHERE {where_sql}", params)
+            total = cur.fetchone()["cnt"]
+            cur.execute(
+                f"""SELECT id, status, currency, total_amount, tax_amount, customer_id,
+                           billing_email, date_created_gmt, date_updated_gmt,
+                           payment_method, payment_method_title, transaction_id
+                    FROM wp_wc_orders o WHERE {where_sql}
+                    ORDER BY id DESC LIMIT %s OFFSET %s""",
+                params + [per_page, offset],
+            )
+            orders = []
+            for r in cur.fetchall():
+                st = r["status"]
+                orders.append({
+                    "id": r["id"],
+                    "status": st[3:] if st.startswith("wc-") else st,
+                    "currency": r["currency"],
+                    "total": _float(r["total_amount"]),
+                    "tax_total": _float(r["tax_amount"]),
+                    "customer_id": _int(r["customer_id"]),
+                    "billing_email": r["billing_email"],
+                    "date_created": _dt(r["date_created_gmt"]),
+                    "date_modified": _dt(r["date_updated_gmt"]),
+                    "payment_method": r["payment_method"],
+                    "payment_method_title": r["payment_method_title"],
+                    "transaction_id": r["transaction_id"],
+                })
+    return _ok(orders, pagination=_paginate(total, page, per_page))
+
+
+@data_api.get("/orders/<int:oid>")
+@require_api_key
+def get_order(oid):
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM wp_wc_orders WHERE id=%s AND type='shop_order'", (oid,))
+            order = cur.fetchone()
+            if not order:
+                return _err("not_found", f"Order {oid} not found.", 404)
+            meta = _order_meta(cur, oid)
+            items = _order_items(cur, oid)
+    return _ok(_build_order(order, meta, items))
+
+
+@data_api.get("/orders/<int:oid>/items")
+@require_api_key
+def get_order_items(oid):
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM wp_wc_orders WHERE id=%s AND type='shop_order'", (oid,))
+            if not cur.fetchone():
+                return _err("not_found", f"Order {oid} not found.", 404)
+            items = _order_items(cur, oid)
+    return _ok(items)
+
+
+# ---------------------------------------------------------------------------
+# SYNC SUPPORT
+# ---------------------------------------------------------------------------
+
+@data_api.get("/sync/status")
+@require_api_key
+def sync_status():
+    state_path = pathlib.Path(__file__).parent / "event_sync_state.json"
+    event_state: dict = {}
+    if state_path.exists():
+        try:
+            event_state = json.loads(state_path.read_text())
+        except Exception:
+            pass
+
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) as cnt FROM wp_posts WHERE post_type='product' AND post_status NOT IN ('auto-draft','trash')")
+            product_count = cur.fetchone()["cnt"]
+            cur.execute("SELECT COUNT(*) as cnt FROM wp_wc_orders WHERE type='shop_order'")
+            order_count = cur.fetchone()["cnt"]
+            cur.execute("SELECT MAX(post_modified) as last FROM wp_posts WHERE post_type='product' AND post_status != 'auto-draft'")
+            last_product = _dt(cur.fetchone()["last"])
+            cur.execute("SELECT MAX(date_updated_gmt) as last FROM wp_wc_orders WHERE type='shop_order'")
+            last_order = _dt(cur.fetchone()["last"])
+
+    return _ok({
+        "api_version": API_VERSION,
+        "event_sync_cursor": event_state.get("after_id", 0),
+        "product_count": product_count,
+        "order_count": order_count,
+        "last_product_modified": last_product,
+        "last_order_modified": last_order,
+    })
+
+
+@data_api.get("/sync/changed/products")
+@require_api_key
+def changed_products():
+    since = request.args.get("since")
+    if not since:
+        return _err("missing_param", "Required query parameter: since (ISO datetime, e.g. 2026-06-01T00:00:00)", 400)
+    page, per_page = _page_params()
+    offset = (page - 1) * per_page
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT COUNT(*) as cnt FROM wp_posts
+                WHERE post_type='product' AND post_status != 'auto-draft' AND post_modified >= %s""", (since,))
+            total = cur.fetchone()["cnt"]
+            cur.execute("""SELECT ID, post_title, post_name, post_status, post_date, post_modified
+                FROM wp_posts
+                WHERE post_type='product' AND post_status != 'auto-draft' AND post_modified >= %s
+                ORDER BY post_modified ASC LIMIT %s OFFSET %s""", (since, per_page, offset))
+            rows = [{"id": r["ID"], "name": r["post_title"], "slug": r["post_name"],
+                     "status": r["post_status"],
+                     "date_created": _dt(r["post_date"]), "date_modified": _dt(r["post_modified"])}
+                    for r in cur.fetchall()]
+    return _ok(rows, pagination=_paginate(total, page, per_page))
+
+
+@data_api.get("/sync/changed/orders")
+@require_api_key
+def changed_orders():
+    since = request.args.get("since")
+    if not since:
+        return _err("missing_param", "Required query parameter: since (ISO datetime, e.g. 2026-06-01T00:00:00)", 400)
+    page, per_page = _page_params()
+    offset = (page - 1) * per_page
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT COUNT(*) as cnt FROM wp_wc_orders
+                WHERE type='shop_order' AND date_updated_gmt >= %s""", (since,))
+            total = cur.fetchone()["cnt"]
+            cur.execute("""SELECT id, status, currency, total_amount, customer_id,
+                       date_created_gmt, date_updated_gmt
+                FROM wp_wc_orders WHERE type='shop_order' AND date_updated_gmt >= %s
+                ORDER BY date_updated_gmt ASC LIMIT %s OFFSET %s""", (since, per_page, offset))
+            rows = [{"id": r["id"],
+                     "status": r["status"][3:] if r["status"].startswith("wc-") else r["status"],
+                     "currency": r["currency"], "total": _float(r["total_amount"]),
+                     "customer_id": _int(r["customer_id"]),
+                     "date_created": _dt(r["date_created_gmt"]),
+                     "date_modified": _dt(r["date_updated_gmt"])}
+                    for r in cur.fetchall()]
+    return _ok(rows, pagination=_paginate(total, page, per_page))
+
+
+# ---------------------------------------------------------------------------
+# HEALTH
+# ---------------------------------------------------------------------------
+
+@data_api.get("/health")
+@require_api_key
+def api_health():
+    db_ok = False
+    db_error = None
+    product_count = 0
+    order_count = 0
+    try:
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) as cnt FROM wp_posts WHERE post_type='product' AND post_status NOT IN ('auto-draft','trash')")
+                product_count = cur.fetchone()["cnt"]
+                cur.execute("SELECT COUNT(*) as cnt FROM wp_wc_orders WHERE type='shop_order'")
+                order_count = cur.fetchone()["cnt"]
+                db_ok = True
+    except Exception as exc:
+        db_error = str(exc)
+
+    return _ok({
+        "api_version": API_VERSION,
+        "mirror_db": "ok" if db_ok else "error",
+        "mirror_db_error": db_error,
+        "product_count": product_count,
+        "order_count": order_count,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Shared list-view helper (used by category/brand product sub-endpoints)
+# ---------------------------------------------------------------------------
+
+def _product_row_summary(r: dict) -> dict:
+    return {
+        "id": r["ID"],
+        "name": r["post_title"],
+        "slug": r["post_name"],
+        "status": r["post_status"],
+        "sku": r["sku"],
+        "price": _float(r["min_price"]),
+        "on_sale": bool(r["onsale"]),
+        "stock_quantity": _float(r["stock_quantity"]),
+        "stock_status": r["stock_status"],
+        "date_created": _dt(r["post_date"]),
+        "date_modified": _dt(r["post_modified"]),
+    }
