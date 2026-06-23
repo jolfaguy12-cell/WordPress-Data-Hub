@@ -65,6 +65,17 @@ class BDSK_Export_Rest {
 			'callback'            => [ __CLASS__, 'handle_confirm_download' ],
 			'permission_callback' => '__return_true',
 		] );
+
+		register_rest_route( self::NAMESPACE, '/db-export/chunk/(?P<job_id>[0-9a-f\-]{36})', [
+			'methods'             => WP_REST_Server::CREATABLE,
+			'callback'            => [ __CLASS__, 'handle_chunk' ],
+			'permission_callback' => '__return_true',
+			'args'                => [
+				'job_id' => [
+					'validate_callback' => fn( $v ) => (bool) preg_match( '/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i', $v ),
+				],
+			],
+		] );
 	}
 
 	// ---------------------------------------------------------------------------
@@ -112,6 +123,9 @@ class BDSK_Export_Rest {
 			}
 			return $result;
 		}
+
+		// Always include export_mode so Server 2 can branch without a separate health call.
+		$result['export_mode'] = BDSK_Export_Job::get_export_mode();
 
 		return new WP_REST_Response( $result, 202 );
 	}
@@ -173,6 +187,14 @@ class BDSK_Export_Rest {
 		$auth = BDSK_Security::validate_request( $request );
 		if ( is_wp_error( $auth ) ) {
 			return $auth;
+		}
+
+		if ( BDSK_Export_Job::get_export_mode() === 'shared_host_no_file_mode' ) {
+			return new WP_Error(
+				'not_applicable',
+				'Files are streamed directly to the consumer in shared_host_no_file_mode. Use POST /db-export/chunk/{job_id} to retrieve SQL chunks.',
+				[ 'status' => 404 ]
+			);
 		}
 
 		$job_id = $request->get_param( 'job_id' );
@@ -257,5 +279,65 @@ class BDSK_Export_Rest {
 		bdsk_log( "Download confirmed for job {$job_id}." );
 
 		return new WP_REST_Response( [ 'confirmed' => true, 'job_id' => $job_id ], 200 );
+	}
+
+	// ---------------------------------------------------------------------------
+	// POST /db-export/chunk/{job_id}   (shared_host_no_file_mode only)
+	// ---------------------------------------------------------------------------
+
+	public static function handle_chunk( WP_REST_Request $request ): WP_REST_Response|WP_Error {
+		$auth = BDSK_Security::validate_request( $request );
+		if ( is_wp_error( $auth ) ) {
+			return $auth;
+		}
+
+		if ( BDSK_Export_Job::get_export_mode() !== 'shared_host_no_file_mode' ) {
+			return new WP_Error(
+				'mode_mismatch',
+				'The /chunk endpoint is only available in shared_host_no_file_mode. Use polling and /download for local_private_archive_mode.',
+				[ 'status' => 409 ]
+			);
+		}
+
+		$job_id = $request->get_param( 'job_id' );
+		$job    = BDSK_DB::get_job( $job_id );
+		if ( ! $job ) {
+			return new WP_Error( 'not_found', 'Job not found.', [ 'status' => 404 ] );
+		}
+
+		if ( ! in_array( $job['status'], [ 'pending', 'running' ], true ) ) {
+			return new WP_Error(
+				'invalid_state',
+				"Job is not in a processable state (status: {$job['status']}).",
+				[ 'status' => 409 ]
+			);
+		}
+
+		// Prevent concurrent chunk processing for the same job.
+		$lock_key = 'bdsk_chunk_lock_' . $job_id;
+		if ( get_transient( $lock_key ) ) {
+			return new WP_Error(
+				'chunk_conflict',
+				'A chunk is already being processed for this job. Retry after a moment.',
+				[ 'status' => 409 ]
+			);
+		}
+		set_transient( $lock_key, true, 60 );
+
+		try {
+			$result = BDSK_Export_Job::process_chunk_streaming( $job_id );
+		} catch ( \Throwable $e ) {
+			delete_transient( $lock_key );
+			BDSK_DB::update_job( $job_id, [
+				'status'     => 'failed',
+				'last_error' => substr( $e->getMessage(), 0, 500 ),
+			] );
+			bdsk_log( "Streaming chunk failed for job {$job_id}: " . $e->getMessage() );
+			return new WP_Error( 'chunk_failed', $e->getMessage(), [ 'status' => 500 ] );
+		}
+
+		delete_transient( $lock_key );
+
+		return new WP_REST_Response( array_merge( [ 'job_id' => $job_id ], $result ), 200 );
 	}
 }

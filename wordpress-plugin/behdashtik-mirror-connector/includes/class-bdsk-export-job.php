@@ -58,11 +58,28 @@ class BDSK_Export_Job {
 			return new WP_Error( 'storage_misconfigured', self::export_storage_error(), [ 'status' => 503 ] );
 		}
 		if ( 'shared_host_no_file_mode' === $mode ) {
-			return new WP_Error(
-				'streaming_not_implemented',
-				'shared_host_no_file_mode streaming export is not yet implemented. Set BDSK_EXPORT_STORAGE_PATH outside the web root in wp-config.php to enable local archive mode.',
-				[ 'status' => 501 ]
-			);
+			// Streaming mode: create job record only — no Action Scheduler.
+			// Server 2 drives chunk processing synchronously via POST /db-export/chunk/{job_id}.
+			$job_id = BDSK_DB::create_job( [
+				'status'     => 'pending',
+				'started_at' => current_time( 'mysql', true ),
+			] );
+
+			if ( ! $job_id ) {
+				return new WP_Error( 'db_error', 'Could not create export job.', [ 'status' => 500 ] );
+			}
+
+			if ( $test_mode ) {
+				set_transient( 'bdsk_test_mode_' . $job_id, true, 900 );
+			}
+
+			bdsk_log( "Streaming export job created: {$job_id}", [ 'test_mode' => $test_mode ] );
+
+			return [
+				'job_id'      => $job_id,
+				'status'      => 'pending',
+				'export_mode' => 'shared_host_no_file_mode',
+			];
 		}
 
 		$job_id = BDSK_DB::create_job( [
@@ -287,6 +304,188 @@ class BDSK_Export_Job {
 			] );
 			bdsk_log( "Marked job {$job['job_id']} as failed (stalled)." );
 		}
+	}
+
+	// ---------------------------------------------------------------------------
+	// Streaming chunk processor — called synchronously by REST /db-export/chunk
+	// ---------------------------------------------------------------------------
+
+	/**
+	 * Generates one SQL chunk for shared_host_no_file_mode.
+	 * Each call advances the export cursor by up to BDSK_STREAMING_CHUNK_SIZE rows.
+	 * Returns an array with base64-encoded SQL and progress fields.
+	 *
+	 * @throws \RuntimeException when the job is not in a processable state.
+	 */
+	public static function process_chunk_streaming( string $job_id ): array {
+		global $wpdb;
+
+		$job = BDSK_DB::get_job( $job_id );
+		if ( ! $job || ! in_array( $job['status'], [ 'pending', 'running' ], true ) ) {
+			$state = $job ? $job['status'] : 'not_found';
+			throw new \RuntimeException( "Job {$job_id} is not processable (status: {$state})." );
+		}
+
+		BDSK_DB::update_job( $job_id, [
+			'status'       => 'running',
+			'heartbeat_at' => current_time( 'mysql', true ),
+		] );
+
+		$chunk_size = (int) apply_filters( 'bdsk_streaming_chunk_size', BDSK_STREAMING_CHUNK_SIZE );
+		$test_mode  = (bool) get_transient( 'bdsk_test_mode_' . $job_id );
+		if ( $test_mode ) {
+			$chunk_size = min( $chunk_size, BDSK_TEST_EXPORT_ROWS );
+		}
+
+		$manifest = json_decode( $job['archive_manifest'] ?: '{}', true ) ?: [];
+		$is_first = empty( $manifest );
+
+		// --- First call: initialise table list and manifest ---
+		if ( $is_first ) {
+			$tables   = self::get_tables_list();
+			$manifest = [
+				'db_prefix'        => $wpdb->prefix,
+				'tables_to_export' => $tables,
+				'tables_included'  => [],
+				'chunk_num'        => 0,
+			];
+			BDSK_DB::update_job( $job_id, [
+				'total_tables'     => count( $tables ),
+				'current_table'    => $tables[0] ?? null,
+				'current_offset'   => 0,
+				'archive_manifest' => wp_json_encode( $manifest ),
+			] );
+			// Reload to pick up the new current_table / current_offset values.
+			$job = BDSK_DB::get_job( $job_id );
+		}
+
+		$current_table  = $job['current_table'];
+		$current_offset = (int) $job['current_offset'];
+		$chunk_num      = ( (int) ( $manifest['chunk_num'] ?? 0 ) ) + 1;
+		$sql            = '';
+		$complete       = false;
+
+		// SQL preamble — written only in the first chunk.
+		if ( $is_first ) {
+			$sql .= "-- Behdashtik Mirror Connector streaming export\n";
+			$sql .= "-- Job: {$job_id}\n";
+			$sql .= '-- Generated: ' . gmdate( 'c' ) . "\n\n";
+			$sql .= "SET NAMES utf8mb4;\n";
+			$sql .= "SET FOREIGN_KEY_CHECKS=0;\n";
+			$sql .= "SET SQL_MODE='NO_AUTO_VALUE_ON_ZERO';\n\n";
+		}
+
+		// Edge case: no tables to export.
+		if ( null === $current_table ) {
+			$sql     .= "\nSET FOREIGN_KEY_CHECKS=1;\n";
+			$complete = true;
+			BDSK_DB::update_job( $job_id, [
+				'status'           => 'ready',
+				'finished_at'      => current_time( 'mysql', true ),
+				'progress_percent' => 100.0,
+				'archive_manifest' => wp_json_encode( [
+					'tables_included' => $manifest['tables_included'],
+					'db_prefix'       => $manifest['db_prefix'],
+				] ),
+			] );
+
+			return [
+				'sql_chunk'        => base64_encode( $sql ),
+				'complete'         => true,
+				'progress_percent' => 100.0,
+				'current_table'    => null,
+				'chunk_num'        => $chunk_num,
+			];
+		}
+
+		// Write schema when starting a new table (offset = 0).
+		if ( 0 === $current_offset ) {
+			$schema_sql = self::get_table_schema_sql( $current_table );
+			if ( '' !== $schema_sql ) {
+				$sql .= $schema_sql;
+			}
+		}
+
+		// Export row batch.
+		$rows_result = self::get_rows_sql( $current_table, $current_offset, $chunk_size );
+		$rows_count  = $rows_result['count'];
+		$sql        .= $rows_result['sql'];
+
+		$new_offset      = $current_offset + $rows_count;
+		$effective_limit = $test_mode ? BDSK_TEST_EXPORT_ROWS : PHP_INT_MAX;
+		$table_done      = $rows_count < $chunk_size || $new_offset >= $effective_limit;
+
+		$job_update = [
+			'current_offset'      => $new_offset,
+			'exported_rows_count' => ( (int) $job['exported_rows_count'] ) + $rows_count,
+			'heartbeat_at'        => current_time( 'mysql', true ),
+		];
+
+		if ( $table_done ) {
+			$manifest['tables_included'][] = $current_table;
+			$remaining = array_values(
+				array_diff( $manifest['tables_to_export'], $manifest['tables_included'] )
+			);
+			$manifest['tables_to_export'] = $remaining;
+			$next_table = $remaining[0] ?? null;
+
+			$tables_done = (int) $job['tables_completed'] + 1;
+			$job_update['tables_completed'] = $tables_done;
+			$job_update['current_table']    = $next_table;
+			$job_update['current_offset']   = 0;
+			$job_update['progress_percent'] = round(
+				( $tables_done / max( (int) $job['total_tables'], 1 ) ) * 100,
+				1
+			);
+
+			if ( null === $next_table ) {
+				// All tables done — write SQL footer and finalise.
+				$sql    .= "\nSET FOREIGN_KEY_CHECKS=1;\n";
+				$complete = true;
+
+				$job_update['status']           = 'ready';
+				$job_update['finished_at']      = current_time( 'mysql', true );
+				$job_update['progress_percent'] = 100.0;
+				$job_update['archive_manifest'] = wp_json_encode( [
+					'tables_included' => $manifest['tables_included'],
+					'db_prefix'       => $manifest['db_prefix'],
+				] );
+
+				BDSK_DB::update_job( $job_id, $job_update );
+				bdsk_log( "Streaming export job {$job_id} complete (chunk {$chunk_num})." );
+
+				return [
+					'sql_chunk'        => base64_encode( $sql ),
+					'complete'         => true,
+					'progress_percent' => 100.0,
+					'current_table'    => null,
+					'chunk_num'        => $chunk_num,
+				];
+			}
+		} else {
+			// Still inside the same table — compute fine-grained progress.
+			$total_in_table = (int) $wpdb->get_var(
+				'SELECT COUNT(*) FROM `' . esc_sql( $current_table ) . '`'
+			);
+			if ( $total_in_table > 0 && (int) $job['total_tables'] > 0 ) {
+				$table_progress = min( $new_offset / $total_in_table, 1.0 );
+				$base           = ( (int) $job['tables_completed'] / (int) $job['total_tables'] ) * 100;
+				$per_table      = ( 1 / (int) $job['total_tables'] ) * 100;
+				$job_update['progress_percent'] = round( $base + $table_progress * $per_table, 1 );
+			}
+		}
+
+		$manifest['chunk_num']          = $chunk_num;
+		$job_update['archive_manifest'] = wp_json_encode( $manifest );
+		BDSK_DB::update_job( $job_id, $job_update );
+
+		return [
+			'sql_chunk'        => base64_encode( $sql ),
+			'complete'         => false,
+			'progress_percent' => (float) ( $job_update['progress_percent'] ?? (float) $job['progress_percent'] ),
+			'current_table'    => $job_update['current_table'] ?? $current_table,
+			'chunk_num'        => $chunk_num,
+		];
 	}
 
 	// ---------------------------------------------------------------------------

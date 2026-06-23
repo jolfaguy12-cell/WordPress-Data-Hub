@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import base64
 import concurrent.futures
 import gzip
 import hashlib
@@ -145,7 +146,8 @@ def health_check(cfg: dict) -> dict:
 # 2. Start export
 # ---------------------------------------------------------------------------
 
-def start_export(cfg: dict, test_mode: bool = False) -> str:
+def start_export(cfg: dict, test_mode: bool = False) -> tuple[str, str]:
+    """Start a new export job. Returns (job_id, export_mode)."""
     print(f"[export] Starting export job (test_mode={test_mode}) …")
     body = {}
     if test_mode:
@@ -156,11 +158,15 @@ def start_export(cfg: dict, test_mode: bool = False) -> str:
     if "error" in data and data.get("error") == "export_already_running":
         job_id = data["job_id"]
         print(f"[export] Export already running: {job_id} — attaching to it.")
-        return job_id
+        # Determine mode from current health since start response is a 409 body.
+        health = api_get(cfg, "/health")
+        export_mode = health.get("export_mode", "local_private_archive_mode")
+        return job_id, export_mode
 
-    job_id = data["job_id"]
-    print(f"[export] Job created: {job_id} (status: {data.get('status')})")
-    return job_id
+    job_id      = data["job_id"]
+    export_mode = data.get("export_mode", "local_private_archive_mode")
+    print(f"[export] Job created: {job_id} (status: {data.get('status')}, mode: {export_mode})")
+    return job_id, export_mode
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +287,80 @@ def download_archive(cfg: dict, job_id: str, status_data: dict) -> pathlib.Path:
     (job_dir / "meta.json").write_text(json.dumps(meta, indent=2))
     print(f"[download] All parts downloaded to {job_dir}")
     return job_dir
+
+
+# ---------------------------------------------------------------------------
+# 4b. Streaming export (shared_host_no_file_mode)
+# ---------------------------------------------------------------------------
+
+def _run_streaming_export(cfg: dict, job_id: str) -> pathlib.Path:
+    """Drive chunk loop for shared_host_no_file_mode. Assembles gzip archive locally."""
+    archive_dir  = pathlib.Path(cfg["archive_storage_path"]) / job_id
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = archive_dir / f"{job_id}.sql.gz"
+
+    print(f"[stream] Streaming export for job {job_id} …")
+    print(f"[stream] Archive: {archive_path}")
+
+    chunk_num   = 0
+    total_bytes = 0
+
+    with gzip.open(str(archive_path), "wb") as gz_out:
+        while True:
+            resp = api_post(cfg, f"/db-export/chunk/{job_id}")
+
+            if "error" in resp:
+                raise RuntimeError(f"[stream] chunk endpoint returned error: {resp}")
+
+            sql_bytes    = base64.b64decode(resp["sql_chunk"])
+            bytes_this   = len(sql_bytes)
+            gz_out.write(sql_bytes)
+            total_bytes += bytes_this
+            chunk_num   += 1
+
+            progress = resp.get("progress_percent", 0)
+            table    = resp.get("current_table") or "(done)"
+            print(
+                f"[stream] chunk {chunk_num:4d}  {progress:5.1f}%  "
+                f"{bytes_this:7,} SQL bytes  {table}"
+            )
+
+            if resp.get("complete"):
+                break
+
+    archive_size   = archive_path.stat().st_size
+    archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+
+    print(
+        f"[stream] Complete: {chunk_num} chunks, {total_bytes:,} SQL bytes, "
+        f"{archive_size:,} compressed bytes"
+    )
+    print(f"[stream] sha256={archive_sha256[:32]}…")
+
+    meta = {
+        "backup_id":       job_id,
+        "job_id":          job_id,
+        "export_mode":     "shared_host_no_file_mode",
+        "parts": [{
+            "filename": archive_path.name,
+            "size":     archive_size,
+            "sha256":   archive_sha256,
+        }],
+        "archive_size":    archive_size,
+        "checksum":        archive_sha256,
+        "created_at":      datetime.now(timezone.utc).isoformat(),
+        "downloaded_at":   datetime.now(timezone.utc).isoformat(),
+        "source_site":     cfg["wp_base_url"],
+        "db_prefix":       "wp_",
+        "tables_included": [],
+        "import_status":   "pending",
+        "archive_until":   None,
+    }
+    (archive_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    print(f"[stream] Archive stored at {archive_dir}")
+
+    confirm_download(cfg, job_id)
+    return archive_dir
 
 
 # ---------------------------------------------------------------------------
@@ -526,11 +606,14 @@ def run_pipeline(cfg: dict, test_mode: bool = False) -> None:
 
     health_check(cfg)
 
-    job_id = start_export(cfg, test_mode=test_mode)
-    status = poll_until_ready(cfg, job_id)
+    job_id, export_mode = start_export(cfg, test_mode=test_mode)
 
-    job_dir = download_archive(cfg, job_id, status)
-    confirm_download(cfg, job_id)
+    if export_mode == "shared_host_no_file_mode":
+        job_dir = _run_streaming_export(cfg, job_id)
+    else:
+        status  = poll_until_ready(cfg, job_id)
+        job_dir = download_archive(cfg, job_id, status)
+        confirm_download(cfg, job_id)
 
     staging_db = import_archive(cfg, job_id, job_dir)
 
@@ -549,6 +632,44 @@ def run_pipeline(cfg: dict, test_mode: bool = False) -> None:
     print(f"Pipeline complete. Mirror DB '{cfg['mirror_db']['name']}' updated.")
     print(f"Archive stored at: {job_dir}")
     print("=" * 60)
+
+
+def run_chunk_test(cfg: dict) -> None:
+    """Start a streaming job, fetch exactly one chunk, print result. Diagnostic only."""
+    print("[chunk-test] Starting streaming export job …")
+    data = api_post(cfg, "/db-export/start")
+    job_id      = data.get("job_id")
+    export_mode = data.get("export_mode")
+
+    if not job_id:
+        raise RuntimeError(f"[chunk-test] No job_id in response: {data}")
+    if export_mode != "shared_host_no_file_mode":
+        raise RuntimeError(
+            f"[chunk-test] Expected shared_host_no_file_mode, got '{export_mode}'. "
+            "Remove BDSK_EXPORT_STORAGE_PATH from wp-config.php to use streaming mode."
+        )
+
+    print(f"[chunk-test] Job {job_id} created ({export_mode})")
+    print("[chunk-test] Fetching first chunk …")
+
+    resp      = api_post(cfg, f"/db-export/chunk/{job_id}")
+    sql_bytes = base64.b64decode(resp["sql_chunk"])
+
+    print(f"[chunk-test] chunk_num     : {resp.get('chunk_num')}")
+    print(f"[chunk-test] SQL bytes      : {len(sql_bytes):,}")
+    print(f"[chunk-test] progress       : {resp.get('progress_percent', 0):.1f}%")
+    print(f"[chunk-test] current_table  : {resp.get('current_table') or '(done)'}")
+    print(f"[chunk-test] complete       : {resp.get('complete')}")
+    print(f"[chunk-test] SQL preview (first 300 chars):")
+    preview = sql_bytes[:300].decode("utf-8", errors="replace")
+    for line in preview.splitlines():
+        print(f"  {line}")
+
+    print(
+        f"\n[chunk-test] PASS — chunk endpoint works.\n"
+        f"[chunk-test] Note: job {job_id} is left in 'running' state and will be\n"
+        f"[chunk-test] auto-marked stalled after {15} min by the heartbeat checker."
+    )
 
 
 def import_only(cfg: dict, job_dir_path: str) -> None:
@@ -1788,6 +1909,7 @@ def run_status(cfg: dict) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Behdashtik Mirror Connector pipeline")
     parser.add_argument("--health-only",     action="store_true", help="Only run health check")
+    parser.add_argument("--chunk-test",      action="store_true", help="Start a streaming job, fetch one chunk, print result (diagnostic)")
     parser.add_argument("--test",            action="store_true", help="Use test export (50 rows per table)")
     parser.add_argument("--import-only",     metavar="JOB_DIR",   help="Re-import an already-downloaded archive")
     parser.add_argument("--prune",           action="store_true", help="Prune expired local archives and exit")
@@ -1804,6 +1926,8 @@ if __name__ == "__main__":
             prune_old_archives(cfg)
         elif args.health_only:
             health_check(cfg)
+        elif args.chunk_test:
+            run_chunk_test(cfg)
         elif args.import_only:
             import_only(cfg, args.import_only)
         elif args.media_sync_full:
