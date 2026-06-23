@@ -29,8 +29,10 @@ class BDSK_Health {
 
 		$media_status = BDSK_Media_Index::get_status();
 
+		$export_storage_error = BDSK_Export_Job::export_storage_error();
+
 		return [
-			'status'                   => 'ok',
+			'status'                   => null !== $export_storage_error ? 'error' : 'ok',
 			'site_url'                 => get_site_url(),
 			'plugin_version'           => BDSK_VERSION,
 			'wordpress_version'        => get_bloginfo( 'version' ),
@@ -53,6 +55,8 @@ class BDSK_Health {
 			'media_index_last_built_at'  => $media_status['last_full_build_at'],
 			'event_sync_enabled'         => (bool) BDSK_Settings::get( 'event_sync_enabled', true ),
 			'event_outbox_pending_count' => (int) ( BDSK_Event_Outbox::get_stats()['pending'] ?? 0 ),
+			'export_mode'                => BDSK_Export_Job::get_export_mode(),
+			'export_storage_error'       => $export_storage_error,
 			'last_successful_request'    => BDSK_Stats::get_totals()['last_successful_at'] ?? null,
 			'last_cleanup_run'           => BDSK_Stats::get_cleanup_status()['last_run_at'] ?? null,
 		];

@@ -62,29 +62,46 @@ class BDSK_Cleanup {
 			return;
 		}
 
-		$export_dir = BDSK_Export_Job::get_export_dir( $job_id );
+		// In shared_host_no_file_mode no archive files exist; cleanup is a no-op.
+		if ( BDSK_Export_Job::get_export_mode() !== 'local_private_archive_mode' ) {
+			BDSK_DB::update_job( $job_id, [
+				'cleanup_status'   => 'cleaned',
+				'archive_manifest' => null,
+				'checksum'         => null,
+			] );
+			return;
+		}
+
+		$export_dir  = BDSK_Export_Job::get_export_dir( $job_id );
+		$file_errors = [];
 
 		if ( is_dir( $export_dir ) ) {
-			// Delete all files in the export directory
 			$files = glob( $export_dir . '/*' );
 			if ( $files ) {
 				foreach ( $files as $file ) {
-					if ( is_file( $file ) ) {
-						// phpcs:ignore WordPress.WP.AlternativeFunctions.unlink_unlink
-						@unlink( $file );
+					if ( is_file( $file ) && ! unlink( $file ) ) {
+						$file_errors[] = basename( $file );
 					}
 				}
 			}
-			@rmdir( $export_dir ); // remove dir if empty
+			if ( ! rmdir( $export_dir ) && is_dir( $export_dir ) ) {
+				$file_errors[] = '(directory)';
+			}
 		}
 
+		$new_status = empty( $file_errors ) ? 'cleaned' : 'cleanup_failed';
+
 		BDSK_DB::update_job( $job_id, [
-			'cleanup_status'   => 'cleaned',
+			'cleanup_status'   => $new_status,
 			'archive_manifest' => null,
 			'checksum'         => null,
 		] );
 
-		bdsk_log( "Cleaned up export files for job {$job_id}." );
+		if ( $new_status === 'cleanup_failed' ) {
+			bdsk_log( "Cleanup failed for job {$job_id}: could not remove: " . implode( ', ', $file_errors ) );
+		} else {
+			bdsk_log( "Cleaned up export files for job {$job_id}." );
+		}
 	}
 
 	// ---------------------------------------------------------------------------
@@ -100,18 +117,15 @@ class BDSK_Cleanup {
 
 		global $wpdb;
 
-		// Delete ALL files under the export base directory
-		$base = BDSK_Export_Job::get_export_base();
-		if ( is_dir( $base ) ) {
-			self::rmdir_recursive( $base );
-			wp_mkdir_p( $base );
-			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
-			file_put_contents( $base . '/.htaccess', "Deny from all\n" );
-			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
-			file_put_contents( $base . '/index.php', '<?php // Silence is golden.' );
+		// Delete all archive files only in local_private_archive_mode (no files exist in other modes)
+		if ( BDSK_Export_Job::get_export_mode() === 'local_private_archive_mode' ) {
+			$base = BDSK_Export_Job::get_export_base();
+			if ( is_dir( $base ) ) {
+				self::rmdir_recursive( $base );
+			}
 		}
 
-		// Mark all non-cleaned jobs
+		// Mark all non-cleaned jobs as cleaned
 		$wpdb->query(
 			"UPDATE " . BDSK_DB::jobs_table() . "
 			 SET cleanup_status = 'cleaned', archive_manifest = NULL, checksum = NULL,
@@ -151,10 +165,10 @@ class BDSK_Cleanup {
 				self::rmdir_recursive( $path );
 			} else {
 				// phpcs:ignore WordPress.WP.AlternativeFunctions.unlink_unlink
-				@unlink( $path );
+				unlink( $path );
 			}
 		}
-		@rmdir( $dir );
+		rmdir( $dir );
 	}
 }
 

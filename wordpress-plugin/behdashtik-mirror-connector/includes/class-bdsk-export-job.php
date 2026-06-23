@@ -53,6 +53,18 @@ class BDSK_Export_Job {
 			return new WP_Error( 'backup_export_disabled', 'Backup export is not enabled.', [ 'status' => 403 ] );
 		}
 
+		$mode = self::get_export_mode();
+		if ( 'config_error' === $mode ) {
+			return new WP_Error( 'storage_misconfigured', self::export_storage_error(), [ 'status' => 503 ] );
+		}
+		if ( 'shared_host_no_file_mode' === $mode ) {
+			return new WP_Error(
+				'streaming_not_implemented',
+				'shared_host_no_file_mode streaming export is not yet implemented. Set BDSK_EXPORT_STORAGE_PATH outside the web root in wp-config.php to enable local archive mode.',
+				[ 'status' => 501 ]
+			);
+		}
+
 		$job_id = BDSK_DB::create_job( [
 			'status'     => 'pending',
 			'started_at' => current_time( 'mysql', true ),
@@ -349,12 +361,55 @@ class BDSK_Export_Job {
 	}
 
 	// ---------------------------------------------------------------------------
-	// Export directory helpers
+	// Export mode and storage helpers
 	// ---------------------------------------------------------------------------
 
+	/**
+	 * Returns the current export mode:
+	 *   'local_private_archive_mode' — BDSK_EXPORT_STORAGE_PATH defined and valid
+	 *   'shared_host_no_file_mode'   — no constant defined (default; Phase 2)
+	 *   'config_error'               — constant defined but path is invalid/web-accessible
+	 */
+	public static function get_export_mode(): string {
+		if ( ! defined( 'BDSK_EXPORT_STORAGE_PATH' ) ) {
+			return 'shared_host_no_file_mode';
+		}
+		$path = rtrim( BDSK_EXPORT_STORAGE_PATH, '/' );
+		if ( str_starts_with( $path, untrailingslashit( ABSPATH ) ) ) {
+			return 'config_error';
+		}
+		if ( ! is_dir( $path ) && ! is_writable( dirname( $path ) ) ) {
+			return 'config_error';
+		}
+		return 'local_private_archive_mode';
+	}
+
+	/**
+	 * Returns a human-readable error string if storage is misconfigured, or null if valid.
+	 */
+	public static function export_storage_error(): ?string {
+		if ( ! defined( 'BDSK_EXPORT_STORAGE_PATH' ) ) {
+			return null; // shared_host_no_file_mode is valid
+		}
+		$path = rtrim( BDSK_EXPORT_STORAGE_PATH, '/' );
+		if ( str_starts_with( $path, untrailingslashit( ABSPATH ) ) ) {
+			return 'BDSK_EXPORT_STORAGE_PATH is inside the web root. It must be a path outside ABSPATH.';
+		}
+		if ( ! is_dir( $path ) && ! is_writable( dirname( $path ) ) ) {
+			return 'BDSK_EXPORT_STORAGE_PATH parent directory is not writable and the path does not exist.';
+		}
+		return null;
+	}
+
+	/**
+	 * Returns the base archive storage directory.
+	 * Only valid in local_private_archive_mode — throws otherwise.
+	 */
 	public static function get_export_base(): string {
-		$upload = wp_upload_dir();
-		return $upload['basedir'] . '/bdsk-exports';
+		if ( self::get_export_mode() !== 'local_private_archive_mode' ) {
+			throw new \LogicException( 'get_export_base() called outside local_private_archive_mode.' );
+		}
+		return rtrim( BDSK_EXPORT_STORAGE_PATH, '/' ) . '/bdsk-exports';
 	}
 
 	public static function get_export_dir( string $job_id ): string {
@@ -371,18 +426,7 @@ class BDSK_Export_Job {
 
 		wp_mkdir_p( $base );
 		wp_mkdir_p( $dir );
-
-		// Protect base directory from direct web access
-		$htaccess = $base . '/.htaccess';
-		if ( ! file_exists( $htaccess ) ) {
-			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
-			file_put_contents( $htaccess, "Deny from all\n" );
-		}
-		$index = $base . '/index.php';
-		if ( ! file_exists( $index ) ) {
-			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
-			file_put_contents( $index, '<?php // Silence is golden.' );
-		}
+		// Storage is outside the web root — no .htaccess or index.php needed.
 	}
 
 	// ---------------------------------------------------------------------------

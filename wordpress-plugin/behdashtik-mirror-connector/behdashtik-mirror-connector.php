@@ -3,7 +3,7 @@
  * Plugin Name:       Behdashtik Mirror Connector
  * Plugin URI:        https://github.com/jolfaguy12-cell/WordPress-Data-Hub
  * Description:       Secure database export pipeline for the Behdashtik WordPress mirror system.
- * Version:           1.5.0
+ * Version:           1.5.1
  * Requires at least: 7.0
  * Requires PHP:      8.1
  * Author:            Behdashtik
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'BDSK_VERSION',            '1.5.0' );
+define( 'BDSK_VERSION',            '1.5.1' );
 define( 'BDSK_PLUGIN_DIR',         plugin_dir_path( __FILE__ ) );
 define( 'BDSK_PLUGIN_URL',         plugin_dir_url( __FILE__ ) );
 define( 'BDSK_EXPORT_CHUNK_SIZE',  500 );          // rows per batch (filterable)
@@ -50,14 +50,21 @@ function bdsk_log( string $message, array $context = [] ): void {
 	if ( ! BDSK_Settings::get( 'debug_log_enabled' ) ) {
 		return;
 	}
-	$log_file  = WP_CONTENT_DIR . '/bdsk-debug.log';
 	$timestamp = gmdate( 'Y-m-d H:i:s' );
 	$line      = "[{$timestamp}] {$message}";
 	if ( ! empty( $context ) ) {
 		$line .= ' ' . wp_json_encode( $context );
 	}
-	// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
-	file_put_contents( $log_file, $line . PHP_EOL, FILE_APPEND | LOCK_EX );
+	// Only write to a persistent file in local_private_archive_mode where storage is
+	// explicitly configured outside the web root. All other modes route to PHP error_log()
+	// to avoid creating unbounded files on the WordPress host.
+	if ( BDSK_Export_Job::get_export_mode() === 'local_private_archive_mode' ) {
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
+		file_put_contents( WP_CONTENT_DIR . '/bdsk-debug.log', $line . PHP_EOL, FILE_APPEND | LOCK_EX );
+	} else {
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		error_log( 'BDSK: ' . $line );
+	}
 }
 
 function bdsk_base64url_encode( string $data ): string {

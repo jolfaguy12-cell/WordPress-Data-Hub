@@ -12,12 +12,12 @@ class BDSK_Settings_Page {
 		add_action( 'admin_init',    [ __CLASS__, 'maybe_redirect_after_activation' ] );
 		add_action( 'admin_notices', [ __CLASS__, 'maybe_show_notice' ] );
 
-		add_action( 'admin_post_bdsk_save_security',     [ __CLASS__, 'handle_save_security' ] );
-		add_action( 'admin_post_bdsk_save_sync',         [ __CLASS__, 'handle_save_sync' ] );
-		add_action( 'admin_post_bdsk_generate_key',      [ __CLASS__, 'handle_generate_key' ] );
+		add_action( 'admin_post_bdsk_save_security',       [ __CLASS__, 'handle_save_security' ] );
+		add_action( 'admin_post_bdsk_save_sync',           [ __CLASS__, 'handle_save_sync' ] );
+		add_action( 'admin_post_bdsk_generate_key',        [ __CLASS__, 'handle_generate_key' ] );
 		add_action( 'admin_post_bdsk_rebuild_media_index', [ __CLASS__, 'handle_rebuild_media_index' ] );
-		add_action( 'admin_post_bdsk_emergency_cleanup', [ __CLASS__, 'handle_emergency_cleanup' ] );
-		add_action( 'admin_post_bdsk_reset_counters',    [ __CLASS__, 'handle_reset_counters' ] );
+		// admin_post_bdsk_emergency_cleanup is handled by BDSK_Cleanup::init()
+		add_action( 'admin_post_bdsk_reset_counters',      [ __CLASS__, 'handle_reset_counters' ] );
 	}
 
 	// ---------------------------------------------------------------------------
@@ -54,6 +54,13 @@ class BDSK_Settings_Page {
 	// ---------------------------------------------------------------------------
 
 	public static function maybe_show_notice(): void {
+		$storage_error = BDSK_Export_Job::export_storage_error();
+		if ( null !== $storage_error ) {
+			echo '<div class="notice notice-error"><p><strong>Behdashtik Mirror Connector — Export Storage Error:</strong> '
+				. esc_html( $storage_error )
+				. ' Export is disabled until this is resolved. Set <code>define(\'BDSK_EXPORT_STORAGE_PATH\', \'/path/outside/webroot/bdsk-private\');</code> in <code>wp-config.php</code>.</p></div>';
+		}
+
 		if ( BDSK_Settings::get( 'disable_ip_check' ) && BDSK_Settings::get( 'enabled' ) ) {
 			echo '<div class="notice notice-warning"><p><strong>Behdashtik Mirror Connector:</strong> IP check is disabled. Only use this in local development.</p></div>';
 		}
@@ -482,7 +489,7 @@ class BDSK_Settings_Page {
 				<tr>
 					<th scope="row">Enable Debug Log</th>
 					<td><label><input type="checkbox" name="bdsk_sync[debug_log_enabled]" value="1" <?php checked( $settings['debug_log_enabled'] ); ?> />
-						Writes to <code>wp-content/bdsk-debug.log</code>. <strong>Never enable in production.</strong></label></td>
+						In <code>local_private_archive_mode</code>: writes to <code>wp-content/bdsk-debug.log</code>. Otherwise routes to PHP <code>error_log()</code>. <strong>Never enable in production.</strong></label></td>
 				</tr>
 			</table>
 
@@ -723,42 +730,6 @@ class BDSK_Settings_Page {
 		$notice = is_wp_error( $result ) ? 'media_rebuild_error' : 'media_rebuild_started';
 
 		wp_safe_redirect( admin_url( 'options-general.php?page=' . self::PAGE_SLUG . '&tab=sync&bdsk_notice=' . $notice ) );
-		exit;
-	}
-
-	public static function handle_emergency_cleanup(): void {
-		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_die( 'Unauthorised.' );
-		}
-		check_admin_referer( 'bdsk_emergency_cleanup' );
-
-		global $wpdb;
-
-		$wpdb->query(
-			"UPDATE " . BDSK_DB::jobs_table() . "
-			 SET status = 'failed', last_error = 'Emergency cleanup by admin'
-			 WHERE status IN ('pending','running','ready','downloading')"
-		);
-
-		$base = BDSK_Export_Job::get_export_base();
-		if ( is_dir( $base ) ) {
-			$dirs = glob( $base . '/*', GLOB_ONLYDIR );
-			if ( $dirs ) {
-				foreach ( $dirs as $dir ) {
-					// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
-					array_map( 'unlink', glob( $dir . '/*' ) ?: [] );
-					@rmdir( $dir ); // phpcs:ignore
-				}
-			}
-		}
-
-		if ( function_exists( 'as_unschedule_all_actions' ) ) {
-			as_unschedule_all_actions( 'bdsk_export_chunk' );
-		}
-
-		bdsk_log( 'Emergency cleanup executed by admin.' );
-
-		wp_safe_redirect( admin_url( 'options-general.php?page=' . self::PAGE_SLUG . '&tab=danger&bdsk_notice=cleanup_done' ) );
 		exit;
 	}
 

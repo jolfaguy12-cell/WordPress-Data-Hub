@@ -89,6 +89,10 @@ class BDSK_Export_Rest {
 			return $auth;
 		}
 
+		if ( 'config_error' === BDSK_Export_Job::get_export_mode() ) {
+			return new WP_Error( 'storage_misconfigured', BDSK_Export_Job::export_storage_error(), [ 'status' => 503 ] );
+		}
+
 		// test mode: only allowed when constant is explicitly set
 		$test_mode = false;
 		if ( defined( 'BDSK_ALLOW_TEST_EXPORT' ) && BDSK_ALLOW_TEST_EXPORT ) {
