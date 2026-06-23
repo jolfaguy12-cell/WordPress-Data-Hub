@@ -157,6 +157,17 @@ def start_export(cfg: dict, test_mode: bool = False) -> tuple[str, str]:
 
     if "error" in data and data.get("error") == "export_already_running":
         job_id = data["job_id"]
+        if test_mode:
+            raise RuntimeError(
+                f"[export] A job ({job_id}) is already running — cannot start a test export.\n"
+                f"[export] Cancel it first:\n"
+                f"[export]   wp --path=/var/www/dev.behdashtik.ir --allow-root eval '\n"
+                f"[export]     global $wpdb;\n"
+                f"[export]     $wpdb->update(BDSK_DB::jobs_table(),\n"
+                f'[export]       ["status"=>"failed","last_error"=>"cancelled"],\n'
+                f'[export]       ["job_id"=>"{job_id}"]);'
+                f"'"
+            )
         print(f"[export] Export already running: {job_id} — attaching to it.")
         # Determine mode from current health since start response is a 409 body.
         health = api_get(cfg, "/health")
@@ -636,8 +647,8 @@ def run_pipeline(cfg: dict, test_mode: bool = False) -> None:
 
 def run_chunk_test(cfg: dict) -> None:
     """Start a streaming job, fetch exactly one chunk, print result. Diagnostic only."""
-    print("[chunk-test] Starting streaming export job …")
-    data = api_post(cfg, "/db-export/start")
+    print("[chunk-test] Starting streaming export job (test_mode=True) …")
+    data = api_post(cfg, "/db-export/start", {"test": True})
     job_id      = data.get("job_id")
     export_mode = data.get("export_mode")
 
@@ -667,8 +678,9 @@ def run_chunk_test(cfg: dict) -> None:
 
     print(
         f"\n[chunk-test] PASS — chunk endpoint works.\n"
-        f"[chunk-test] Note: job {job_id} is left in 'running' state and will be\n"
-        f"[chunk-test] auto-marked stalled after {15} min by the heartbeat checker."
+        f"[chunk-test] Note: job {job_id} left in 'running' state (test_mode=True, 50 rows/table cap).\n"
+        f"[chunk-test] It will be auto-marked stalled after 15 min by the heartbeat checker.\n"
+        f"[chunk-test] To cancel immediately: mark status='failed' via WP-CLI."
     )
 
 
