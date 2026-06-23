@@ -64,6 +64,19 @@ class BDSK_Event_Rest {
 				],
 			],
 		] );
+
+		register_rest_route( self::NAMESPACE, '/snapshot/term/(?P<term_id>\d+)', [
+			'methods'             => 'GET',
+			'callback'            => [ __CLASS__, 'handle_term_snapshot' ],
+			'permission_callback' => '__return_true',
+			'args'                => [
+				'term_id' => [
+					'type'              => 'integer',
+					'minimum'           => 1,
+					'sanitize_callback' => 'absint',
+				],
+			],
+		] );
 	}
 
 	// ---------------------------------------------------------------------------
@@ -343,6 +356,62 @@ class BDSK_Event_Rest {
 			'lookup_row' => $lookup_row,
 			'variations' => $variations,
 			'exists'     => true,
+		], 200 );
+	}
+
+	// ---------------------------------------------------------------------------
+	// GET /snapshot/term/{term_id}
+	// ---------------------------------------------------------------------------
+
+	public static function handle_term_snapshot( WP_REST_Request $request ): WP_REST_Response|WP_Error {
+		$auth = BDSK_Security::validate_request( $request );
+		if ( is_wp_error( $auth ) ) {
+			return $auth;
+		}
+		if ( ! BDSK_Settings::get( 'event_sync_enabled', true ) ) {
+			return new WP_Error( 'event_sync_disabled', 'Event sync is disabled.', [ 'status' => 403 ] );
+		}
+
+		global $wpdb;
+		$term_id = (int) $request->get_param( 'term_id' );
+
+		$term_row = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT term_id, name, slug, term_group FROM {$wpdb->terms} WHERE term_id = %d",
+				$term_id
+			),
+			ARRAY_A
+		);
+
+		if ( null === $term_row ) {
+			return new WP_REST_Response( [ 'exists' => false ], 404 );
+		}
+
+		// A term_id can back more than one taxonomy row — return them all.
+		$taxonomies = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT term_taxonomy_id, term_id, taxonomy, description, parent, count
+				 FROM {$wpdb->term_taxonomy} WHERE term_id = %d ORDER BY term_taxonomy_id ASC",
+				$term_id
+			),
+			ARRAY_A
+		) ?: [];
+
+		// Raw termmeta — do NOT unserialize.
+		$termmeta = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT meta_key, meta_value FROM {$wpdb->termmeta} WHERE term_id = %d ORDER BY meta_id ASC",
+				$term_id
+			),
+			ARRAY_A
+		) ?: [];
+
+		return new WP_REST_Response( [
+			'exists'     => true,
+			'term_id'    => $term_id,
+			'term_row'   => $term_row,
+			'taxonomies' => $taxonomies,
+			'termmeta'   => $termmeta,
 		], 200 );
 	}
 }

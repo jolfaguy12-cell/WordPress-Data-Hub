@@ -5,6 +5,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class BDSK_Event_Outbox {
 
+	/** Taxonomies whose term changes are mirrored. */
+	private const TERM_TAXONOMIES = [ 'product_cat', 'product_tag', 'product_brand' ];
+
 	// ---------------------------------------------------------------------------
 	// Initialization
 	// ---------------------------------------------------------------------------
@@ -28,6 +31,11 @@ class BDSK_Event_Outbox {
 		add_action( 'wp_trash_post',                         [ __CLASS__, 'handle_post_trashed' ] );
 		add_action( 'untrashed_post',                        [ __CLASS__, 'handle_post_untrashed' ], 10, 2 );
 		add_action( 'before_delete_post',                    [ __CLASS__, 'handle_post_before_delete' ] );
+
+		// Term hooks (product_cat / product_tag / product_brand)
+		add_action( 'created_term', [ __CLASS__, 'handle_term_changed' ], 10, 3 );
+		add_action( 'edited_term',  [ __CLASS__, 'handle_term_changed' ], 10, 3 );
+		add_action( 'delete_term',  [ __CLASS__, 'handle_term_deleted' ], 10, 3 );
 	}
 
 	// ---------------------------------------------------------------------------
@@ -157,6 +165,24 @@ class BDSK_Event_Outbox {
 	public static function handle_post_before_delete( int $post_id ): void {
 		if ( 'product' === get_post_type( $post_id ) ) {
 			self::enqueue( 'product', $post_id, 'deleted' );
+		}
+	}
+
+	// ---------------------------------------------------------------------------
+	// Term hook handlers
+	// ---------------------------------------------------------------------------
+
+	// created_term / edited_term: ( $term_id, $tt_id, $taxonomy )
+	public static function handle_term_changed( $term_id, $tt_id, $taxonomy ): void {
+		if ( in_array( $taxonomy, self::TERM_TAXONOMIES, true ) ) {
+			self::enqueue( 'term', (int) $term_id, 'upserted' );
+		}
+	}
+
+	// delete_term: ( $term_id, $tt_id, $taxonomy, $deleted_term, $object_ids )
+	public static function handle_term_deleted( $term_id, $tt_id, $taxonomy ): void {
+		if ( in_array( $taxonomy, self::TERM_TAXONOMIES, true ) ) {
+			self::enqueue( 'term', (int) $term_id, 'deleted' );
 		}
 	}
 

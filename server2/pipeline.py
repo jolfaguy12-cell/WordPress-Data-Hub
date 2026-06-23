@@ -1252,6 +1252,76 @@ def _apply_order_upsert(cur, snapshot: dict) -> None:
             )
 
 
+def _apply_term_upsert(cur, snap: dict) -> None:
+    """Idempotent upsert of a term into wp_terms / wp_term_taxonomy / wp_termmeta.
+
+    Snapshot shape (from GET /snapshot/term/{id}):
+      { term_id, term_row, taxonomies: [...], termmeta: [...] }
+    Covers create, rename, slug change, parent change, description/meta changes.
+    """
+    prefix  = _WP_PREFIX
+    term_id = int(snap["term_id"])
+
+    # wp_terms
+    tr = snap["term_row"]
+    tcols = list(tr.keys())
+    tvals = [tr[c] for c in tcols]
+    tcol_sql = ", ".join(f"`{c}`" for c in tcols)
+    tph_sql  = ", ".join(["%s"] * len(tcols))
+    tupd_sql = ", ".join(f"`{c}` = VALUES(`{c}`)" for c in tcols if c != "term_id")
+    cur.execute(
+        f"INSERT INTO {prefix}terms ({tcol_sql}) VALUES ({tph_sql}) "
+        f"ON DUPLICATE KEY UPDATE {tupd_sql}",
+        tvals,
+    )
+
+    # wp_term_taxonomy — a term_id may back multiple taxonomy rows
+    for tt in snap.get("taxonomies", []):
+        ttcols = list(tt.keys())
+        ttvals = [tt[c] for c in ttcols]
+        ttcol_sql = ", ".join(f"`{c}`" for c in ttcols)
+        ttph_sql  = ", ".join(["%s"] * len(ttcols))
+        ttupd_sql = ", ".join(f"`{c}` = VALUES(`{c}`)" for c in ttcols if c != "term_taxonomy_id")
+        cur.execute(
+            f"INSERT INTO {prefix}term_taxonomy ({ttcol_sql}) VALUES ({ttph_sql}) "
+            f"ON DUPLICATE KEY UPDATE {ttupd_sql}",
+            ttvals,
+        )
+
+    # wp_termmeta — replace all rows for this term
+    cur.execute(f"DELETE FROM {prefix}termmeta WHERE term_id = %s", (term_id,))
+    tm = snap.get("termmeta", [])
+    if tm:
+        tm_ph   = ", ".join(["(%s, %s, %s)"] * len(tm))
+        tm_vals = []
+        for m in tm:
+            tm_vals.extend([term_id, m["meta_key"], m["meta_value"]])
+        cur.execute(
+            f"INSERT INTO {prefix}termmeta (term_id, meta_key, meta_value) VALUES {tm_ph}",
+            tm_vals,
+        )
+
+
+def _apply_term_delete(cur, term_id: int) -> None:
+    """Delete a term and all rows that reference it. Idempotent."""
+    prefix = _WP_PREFIX
+    # Resolve this term's taxonomy ids, then drop any product relationships using them.
+    cur.execute(
+        f"SELECT term_taxonomy_id FROM {prefix}term_taxonomy WHERE term_id = %s",
+        (term_id,),
+    )
+    tt_ids = [r[0] for r in cur.fetchall()]
+    if tt_ids:
+        ph = ",".join(["%s"] * len(tt_ids))
+        cur.execute(
+            f"DELETE FROM {prefix}term_relationships WHERE term_taxonomy_id IN ({ph})",
+            tt_ids,
+        )
+    cur.execute(f"DELETE FROM {prefix}termmeta WHERE term_id = %s", (term_id,))
+    cur.execute(f"DELETE FROM {prefix}term_taxonomy WHERE term_id = %s", (term_id,))
+    cur.execute(f"DELETE FROM {prefix}terms WHERE term_id = %s", (term_id,))
+
+
 def _apply_product_delete(cur, product_id: int) -> None:
     prefix = _WP_PREFIX
     # Get variation IDs
@@ -1273,7 +1343,7 @@ def _apply_product_delete(cur, product_id: int) -> None:
     cur.execute(f"DELETE FROM {prefix}posts WHERE ID = %s", (product_id,))
 
 
-def _apply_product_upsert(cur, snapshot: dict) -> None:
+def _apply_product_upsert(cfg, cur, snapshot: dict) -> None:
     prefix = _WP_PREFIX
     product_id = int(snapshot["product_id"])
     post_row = snapshot["post_row"]
@@ -1305,25 +1375,39 @@ def _apply_product_upsert(cur, snapshot: dict) -> None:
     # Replace term_relationships
     cur.execute(f"DELETE FROM {prefix}term_relationships WHERE object_id = %s", (product_id,))
     tr_rows = []
+    def _lookup_tt_id(taxonomy: str, term_id: int):
+        cur.execute(
+            f"SELECT term_taxonomy_id FROM {prefix}term_taxonomy "
+            f"WHERE taxonomy = %s AND term_id = %s LIMIT 1",
+            (taxonomy, term_id),
+        )
+        r = cur.fetchone()
+        return r[0] if r else None
+
     for term_group in snapshot.get("terms", []):
         taxonomy = term_group["taxonomy"]
         for term_id in term_group["term_ids"]:
-            # Look up term_taxonomy_id in mirror DB
-            cur.execute(
-                f"SELECT term_taxonomy_id FROM {prefix}term_taxonomy "
-                f"WHERE taxonomy = %s AND term_id = %s LIMIT 1",
-                (taxonomy, term_id),
-            )
-            row = cur.fetchone()
-            if row:
-                tr_rows.append((product_id, row[0]))
+            tt_id = _lookup_tt_id(taxonomy, term_id)
+            if tt_id is None:
+                # Term missing in mirror (e.g. created after last full export).
+                # Auto-repair: fetch a small term snapshot and upsert it, then re-lookup.
+                try:
+                    term_snap = api_get(cfg, f"/snapshot/term/{term_id}")
+                    if term_snap.get("exists"):
+                        _apply_term_upsert(cur, term_snap)
+                        tt_id = _lookup_tt_id(taxonomy, term_id)
+                except Exception as exc:  # noqa: BLE001 — repair is best-effort
+                    print(
+                        f"[events] WARN    product={product_id}: term_id={term_id} "
+                        f"({taxonomy}) auto-repair failed: {str(exc)[:120]}"
+                    )
+            if tt_id is not None:
+                tr_rows.append((product_id, tt_id))
             else:
-                # Term exists on source but not in mirror — full export seeds terms.
-                # This relationship will be silently omitted until the next full export.
                 print(
                     f"[events] WARN    product={product_id}: term_id={term_id} ({taxonomy}) "
-                    f"not found in mirror — term assignment skipped. "
-                    f"Run a full export to seed missing terms."
+                    f"not found in mirror and auto-repair did not resolve it — "
+                    f"term assignment skipped."
                 )
     if tr_rows:
         tr_ph = ", ".join(["(%s, %s)"] * len(tr_rows))
@@ -1767,6 +1851,8 @@ def run_event_sync(cfg: dict) -> None:
                     if event_type == "deleted":
                         if entity_type == "order":
                             _apply_order_delete(cur, entity_id)
+                        elif entity_type == "term":
+                            _apply_term_delete(cur, entity_id)
                         else:
                             _apply_product_delete(cur, entity_id)
                     else:
@@ -1777,14 +1863,18 @@ def run_event_sync(cfg: dict) -> None:
                             effective_event = "deleted"
                             if entity_type == "order":
                                 _apply_order_delete(cur, entity_id)
+                            elif entity_type == "term":
+                                _apply_term_delete(cur, entity_id)
                             else:
                                 _apply_product_delete(cur, entity_id)
                         else:
                             snap_for_webhook = snap
                             if entity_type == "order":
                                 _apply_order_upsert(cur, snap)
+                            elif entity_type == "term":
+                                _apply_term_upsert(cur, snap)
                             else:
-                                _apply_product_upsert(cur, snap)
+                                _apply_product_upsert(cfg, cur, snap)
 
                 conn.commit()
                 ack_ids.extend(ev_ids_for_entity)
