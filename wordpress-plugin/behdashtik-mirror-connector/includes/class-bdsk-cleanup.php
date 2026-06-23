@@ -29,6 +29,7 @@ class BDSK_Cleanup {
 
 		$summary = [
 			'export_files_cleaned'    => 0,
+			'export_jobs_pruned'      => 0,
 			'media_rows_pruned'       => 0,
 			'event_rows_pruned'       => 0,
 			'request_log_rows_pruned' => 0,
@@ -39,6 +40,16 @@ class BDSK_Cleanup {
 			self::cleanup_job( $job['job_id'] );
 			$summary['export_files_cleaned']++;
 		}
+
+		// Prune terminal export-job records older than 90 days. By then any
+		// archive files are long gone (cleanup_status = 'cleaned'), so only the
+		// row metadata remains — safe to delete to keep the table bounded.
+		$summary['export_jobs_pruned'] = (int) $wpdb->query(
+			"DELETE FROM " . BDSK_DB::jobs_table() .
+			" WHERE status IN ('downloaded','failed','expired')
+			   AND cleanup_status = 'cleaned'
+			   AND created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 90 DAY)"
+		);
 
 		$summary['media_rows_pruned'] = BDSK_Media_Index::prune_old_deleted_rows();
 

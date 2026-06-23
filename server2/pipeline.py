@@ -583,24 +583,54 @@ def _mysql_exec(host: str, port: int, user: str, password: str, sql: str) -> Non
 # ---------------------------------------------------------------------------
 
 def prune_old_archives(cfg: dict) -> None:
+    """Remove expired and abandoned archive directories.
+
+    Two retention rules apply:
+      1. Successfully imported archives carry an `archive_until` timestamp
+         (set after import — default 150 days). They are removed once past it.
+      2. Failed / interrupted archives never get an `archive_until` (or lack a
+         meta.json entirely). They are useless once stale, so they are removed
+         after `failed_archive_retention_days` (default 14) based on the
+         directory's modification time.
+    """
+    from datetime import datetime as dt, timedelta
+
     base = pathlib.Path(cfg["archive_storage_path"])
     if not base.exists():
         return
+
     now = datetime.now(timezone.utc)
+    failed_retention = timedelta(
+        days=int(cfg.get("failed_archive_retention_days", 14))
+    )
+
     for job_dir in base.iterdir():
         if not job_dir.is_dir():
             continue
+
         meta_path = job_dir / "meta.json"
-        if not meta_path.exists():
+        archive_until = None
+        if meta_path.exists():
+            try:
+                archive_until = json.loads(meta_path.read_text()).get("archive_until")
+            except (json.JSONDecodeError, OSError):
+                archive_until = None
+
+        if archive_until:
+            # Rule 1: successfully imported archive with explicit expiry.
+            if now > dt.fromisoformat(archive_until):
+                print(f"[prune] Removing expired archive: {job_dir.name}")
+                shutil.rmtree(job_dir)
             continue
-        meta = json.loads(meta_path.read_text())
-        archive_until = meta.get("archive_until")
-        if not archive_until:
-            continue
-        from datetime import datetime as dt
-        until = dt.fromisoformat(archive_until)
-        if now > until:
-            print(f"[prune] Removing expired archive: {job_dir.name}")
+
+        # Rule 2: failed / interrupted / orphaned archive (no archive_until).
+        mtime = datetime.fromtimestamp(job_dir.stat().st_mtime, tz=timezone.utc)
+        age = now - mtime
+        if age > failed_retention:
+            print(
+                f"[prune] Removing abandoned archive (no expiry, "
+                f"{age.days}d old): {job_dir.name}"
+            )
             shutil.rmtree(job_dir)
 
 

@@ -1,0 +1,17 @@
+# Behdashtik Mirror Connector — Server 2 pipeline log rotation.
+# Canonical source: /root/wordpress-data-hub/deploy/logrotate/bdsk-pipeline
+# Install to:       /etc/logrotate.d/bdsk-pipeline
+#
+# The pipeline log is appended to by cron (event-sync runs every minute), so it
+# grows ~2 MB/week. Rotate weekly, keep ~3 months compressed, cap by size too.
+/var/log/bdsk-pipeline.log {
+    weekly
+    rotate 12
+    maxsize 20M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 0644 root root
+}

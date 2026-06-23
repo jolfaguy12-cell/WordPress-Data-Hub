@@ -636,7 +636,18 @@ class BDSK_Export_Job {
 		global $wpdb;
 		$like   = $wpdb->esc_like( $wpdb->prefix ) . '%';
 		$tables = $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $like ) );
-		return $tables ?: [];
+
+		/**
+		 * Filters the list of tables included in a DB export.
+		 *
+		 * Return a subset to exclude tables from the mirror (e.g. operational
+		 * queue/history tables). Re-index with array_values() after filtering.
+		 *
+		 * @param string[] $tables Full list of prefixed table names.
+		 */
+		$tables = apply_filters( 'bdsk_export_tables', $tables ?: [] );
+
+		return array_values( $tables );
 	}
 
 	private static function get_table_schema_sql( string $table ): string {
