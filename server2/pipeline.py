@@ -67,12 +67,15 @@ def _parse_json(text: str, context: str) -> dict:
 
 def api_get(cfg: dict, path: str, params: dict | None = None) -> dict:
     url = cfg["wp_base_url"].rstrip("/") + "/wp-json/behdashtik-connector/v1" + path
-    resp = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {cfg['api_secret']}"},
-        params=params,
-        timeout=cfg.get("request_timeout_seconds", 60),
-    )
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {cfg['api_secret']}"},
+            params=params,
+            timeout=cfg.get("request_timeout_seconds", 60),
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"GET {path} connection failed: {exc}") from None
     if not resp.ok:
         raise RuntimeError(f"GET {path} failed: {resp.status_code} — {resp.text[:300]}")
     return _parse_json(resp.text, f"GET {path}")
@@ -104,15 +107,18 @@ def _trigger_as_queue(cfg: dict) -> None:
 
 def api_post(cfg: dict, path: str, body: dict | None = None) -> dict:
     url = cfg["wp_base_url"].rstrip("/") + "/wp-json/behdashtik-connector/v1" + path
-    resp = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {cfg['api_secret']}",
-            "Content-Type": "application/json",
-        },
-        json=body or {},
-        timeout=cfg.get("request_timeout_seconds", 60),
-    )
+    try:
+        resp = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {cfg['api_secret']}",
+                "Content-Type": "application/json",
+            },
+            json=body or {},
+            timeout=cfg.get("request_timeout_seconds", 60),
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"POST {path} connection failed: {exc}") from None
     if not resp.ok and resp.status_code not in (409,):
         raise RuntimeError(f"POST {path} failed: {resp.status_code} — {resp.text[:300]}")
     return _parse_json(resp.text, f"POST {path}")
@@ -1311,6 +1317,14 @@ def _apply_product_upsert(cur, snapshot: dict) -> None:
             row = cur.fetchone()
             if row:
                 tr_rows.append((product_id, row[0]))
+            else:
+                # Term exists on source but not in mirror — full export seeds terms.
+                # This relationship will be silently omitted until the next full export.
+                print(
+                    f"[events] WARN    product={product_id}: term_id={term_id} ({taxonomy}) "
+                    f"not found in mirror — term assignment skipped. "
+                    f"Run a full export to seed missing terms."
+                )
     if tr_rows:
         tr_ph = ", ".join(["(%s, %s)"] * len(tr_rows))
         tr_vals = [v for pair in tr_rows for v in pair]
@@ -1675,6 +1689,30 @@ def run_event_sync(cfg: dict) -> None:
 
     data   = api_get(cfg, "/events/pending", {"after_id": after_id, "limit": batch})
     events = data.get("items", [])
+
+    # Cursor desync guard: if we got no events but after_id > 0, check whether
+    # the source outbox has ANY pending events at all. If it does and their ids
+    # are all below our cursor, the source DB was restored or reimported to an
+    # earlier state and the cursor is now ahead of the source — all new events
+    # would be silently skipped forever without this check.
+    if not events and after_id > 0:
+        probe        = api_get(cfg, "/events/pending", {"after_id": 0, "limit": 1})
+        probe_events = probe.get("items", [])
+        if probe_events:
+            oldest_pending_id = int(probe_events[0]["id"])
+            if after_id >= oldest_pending_id:
+                # Cursor is at or ahead of the oldest pending event — desync confirmed.
+                new_cursor = max(0, oldest_pending_id - 1)
+                print(
+                    f"[events] WARNING: cursor desync — stored cursor ({after_id}) is ahead of "
+                    f"source outbox (oldest pending id={oldest_pending_id}). "
+                    f"Source DB may have been restored. Resetting cursor to {new_cursor} "
+                    f"to recover pending events. Reprocessing is idempotent (UPSERT)."
+                )
+                after_id = new_cursor
+                _save_event_state({"after_id": after_id})
+                data   = api_get(cfg, "/events/pending", {"after_id": after_id, "limit": batch})
+                events = data.get("items", [])
 
     if not events:
         print("[events] No pending events.")
