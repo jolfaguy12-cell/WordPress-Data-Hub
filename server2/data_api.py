@@ -161,6 +161,25 @@ def _float(val) -> float | None:
         return None
 
 
+def _mask_email(email: str | None) -> str | None:
+    if not email:
+        return None
+    try:
+        local, domain = email.split("@", 1)
+        return f"{local[:1]}***@{domain}"
+    except ValueError:
+        return "***"
+
+
+def _mask_phone(phone: str | None) -> str | None:
+    if not phone:
+        return None
+    p = str(phone).strip()
+    if len(p) <= 5:
+        return "***"
+    return f"{p[:3]}***{p[-2:]}"
+
+
 # ---------------------------------------------------------------------------
 # Internal: product helpers
 # ---------------------------------------------------------------------------
@@ -914,19 +933,77 @@ def brand_products(bid):
 # ORDERS
 # ---------------------------------------------------------------------------
 
+_UNPAID_STATUSES = ("wc-pending", "wc-failed", "wc-on-hold")
+_UNPAID_REASON = {
+    "wc-pending":  "pending_payment",
+    "wc-failed":   "payment_failed",
+    "wc-on-hold":  "on_hold",
+}
+
+
+def _resolve_src(bs_id: str | None, cv: str) -> tuple[str, str, str | None, str | None]:
+    """Return (order_source, source_channel, external_order_id, external_marketplace)."""
+    if bs_id:
+        return "basalam", "basalam", bs_id, "basalam"
+    if cv == "checkout":
+        return "website", "woocommerce_checkout", None, None
+    if cv == "admin":
+        return "manual", "admin", None, None
+    return "unknown", cv or None, None, None
+
+
+def _batch_src(cur, order_ids: list) -> tuple[dict, dict, dict]:
+    """Batch-fetch Basalam hash IDs, created_via, and billing phones for a list of order IDs.
+    Returns (src_map, op_map, phone_map).
+    """
+    if not order_ids:
+        return {}, {}, {}
+    ph = ",".join(["%s"] * len(order_ids))
+    cur.execute(
+        f"SELECT order_id, meta_value FROM wp_wc_orders_meta"
+        f" WHERE order_id IN ({ph}) AND meta_key='_sync_basalam_hash_id'",
+        order_ids,
+    )
+    src_map = {r["order_id"]: r["meta_value"] for r in cur.fetchall()}
+    cur.execute(
+        f"SELECT order_id, created_via FROM wp_wc_order_operational_data WHERE order_id IN ({ph})",
+        order_ids,
+    )
+    op_map = {r["order_id"]: (r["created_via"] or "") for r in cur.fetchall()}
+    cur.execute(
+        f"SELECT order_id, phone FROM wp_wc_order_addresses"
+        f" WHERE order_id IN ({ph}) AND address_type='billing'",
+        order_ids,
+    )
+    phone_map = {r["order_id"]: r["phone"] for r in cur.fetchall()}
+    return src_map, op_map, phone_map
+
+
 @data_api.get("/orders")
 @require_api_key
 def list_orders():
+    """List orders with filtering, pagination, and PII-masked contact fields.
+
+    Filters: status, order_source, source_channel, external_marketplace,
+             customer_id, date_from (alias: date_after), date_to (alias: date_before),
+             has_phone (0|1), has_email (0|1)
+    """
     page, per_page = _page_params()
     offset = (page - 1) * per_page
 
-    status = request.args.get("status")
-    customer_id = request.args.get("customer_id", type=int)
-    date_after = request.args.get("date_after")
-    date_before = request.args.get("date_before")
+    status               = request.args.get("status")
+    order_source         = request.args.get("order_source") or request.args.get("source")
+    source_channel       = request.args.get("source_channel")
+    external_marketplace = request.args.get("external_marketplace")
+    customer_id          = request.args.get("customer_id", type=int)
+    date_from            = request.args.get("date_from") or request.args.get("date_after")
+    date_to              = request.args.get("date_to") or request.args.get("date_before")
+    has_phone_arg        = request.args.get("has_phone")
+    has_email_arg        = request.args.get("has_email")
 
-    where = ["o.type = 'shop_order'"]
-    params: list = []
+    where:  list[str] = ["o.type = 'shop_order'"]
+    params: list      = []
+
     if status:
         s = status if status.startswith("wc-") else f"wc-{status}"
         where.append("o.status = %s")
@@ -934,12 +1011,57 @@ def list_orders():
     if customer_id:
         where.append("o.customer_id = %s")
         params.append(customer_id)
-    if date_after:
+    if date_from:
         where.append("o.date_created_gmt >= %s")
-        params.append(date_after)
-    if date_before:
+        params.append(date_from)
+    if date_to:
         where.append("o.date_created_gmt <= %s")
-        params.append(date_before)
+        params.append(date_to)
+
+    # Source/channel filters (subquery-based; fast enough for dev dataset)
+    _bs_sub = "SELECT order_id FROM wp_wc_orders_meta WHERE meta_key='_sync_basalam_hash_id'"
+    _op_cv  = "SELECT order_id FROM wp_wc_order_operational_data WHERE created_via=%s"
+    if order_source == "basalam" or external_marketplace == "basalam":
+        where.append(f"o.id IN ({_bs_sub})")
+    elif order_source == "website":
+        where.append(f"o.id NOT IN ({_bs_sub})")
+        where.append(f"o.id IN ({_op_cv})")
+        params.append("checkout")
+    elif order_source == "manual":
+        where.append(f"o.id NOT IN ({_bs_sub})")
+        where.append(f"o.id IN ({_op_cv})")
+        params.append("admin")
+    elif order_source == "unknown":
+        where.append(f"o.id NOT IN ({_bs_sub})")
+        where.append(f"o.id NOT IN (SELECT order_id FROM wp_wc_order_operational_data WHERE created_via IN ('checkout','admin'))")
+
+    if source_channel and not order_source:
+        if source_channel == "basalam":
+            where.append(f"o.id IN ({_bs_sub})")
+        elif source_channel == "woocommerce_checkout":
+            where.append(f"o.id IN ({_op_cv})")
+            params.append("checkout")
+        elif source_channel == "admin":
+            where.append(f"o.id IN ({_op_cv})")
+            params.append("admin")
+
+    if has_email_arg == "1":
+        where.append("o.billing_email IS NOT NULL AND o.billing_email != ''")
+    elif has_email_arg == "0":
+        where.append("(o.billing_email IS NULL OR o.billing_email = '')")
+
+    if has_phone_arg == "1":
+        where.append(
+            "EXISTS (SELECT 1 FROM wp_wc_order_addresses pa"
+            " WHERE pa.order_id=o.id AND pa.address_type='billing'"
+            " AND pa.phone IS NOT NULL AND pa.phone != '')"
+        )
+    elif has_phone_arg == "0":
+        where.append(
+            "NOT EXISTS (SELECT 1 FROM wp_wc_order_addresses pa"
+            " WHERE pa.order_id=o.id AND pa.address_type='billing'"
+            " AND pa.phone IS NOT NULL AND pa.phone != '')"
+        )
 
     where_sql = " AND ".join(where)
 
@@ -948,73 +1070,292 @@ def list_orders():
             cur.execute(f"SELECT COUNT(*) as cnt FROM wp_wc_orders o WHERE {where_sql}", params)
             total = cur.fetchone()["cnt"]
             cur.execute(
-                f"""SELECT id, status, currency, total_amount, tax_amount, customer_id,
-                           billing_email, date_created_gmt, date_updated_gmt,
-                           payment_method, payment_method_title, transaction_id
-                    FROM wp_wc_orders o WHERE {where_sql}
-                    ORDER BY id DESC LIMIT %s OFFSET %s""",
+                f"""SELECT o.id, o.status, o.currency, o.total_amount, o.tax_amount,
+                           o.customer_id, o.billing_email,
+                           o.date_created_gmt, o.date_updated_gmt,
+                           o.payment_method, o.payment_method_title, o.transaction_id
+                    FROM wp_wc_orders o
+                    WHERE {where_sql}
+                    ORDER BY o.id DESC LIMIT %s OFFSET %s""",
                 params + [per_page, offset],
             )
-            rows = cur.fetchall()
+            rows      = cur.fetchall()
             order_ids = [r["id"] for r in rows]
-            # Batch-fetch source info for listed orders
-            src_map: dict = {}
-            if order_ids:
-                id_ph = ",".join(["%s"] * len(order_ids))
-                cur.execute(
-                    f"SELECT order_id, meta_key, meta_value FROM wp_wc_orders_meta"
-                    f" WHERE order_id IN ({id_ph}) AND meta_key = '_sync_basalam_hash_id'",
-                    order_ids,
-                )
-                for sm in cur.fetchall():
-                    src_map[sm["order_id"]] = sm["meta_value"]
-                cur.execute(
-                    f"SELECT order_id, created_via FROM wp_wc_order_operational_data"
-                    f" WHERE order_id IN ({id_ph})",
-                    order_ids,
-                )
-                op_map = {r["order_id"]: r["created_via"] for r in cur.fetchall()}
-            else:
-                op_map = {}
+            src_map, op_map, phone_map = _batch_src(cur, order_ids)
 
             orders = []
             for r in rows:
-                st  = r["status"]
-                oid = r["id"]
+                st    = r["status"]
+                oid   = r["id"]
+                email = r["billing_email"] or None
+                phone = phone_map.get(oid) or None
                 bs_id = src_map.get(oid)
-                cv    = op_map.get(oid) or ""
-                if bs_id:
-                    order_source, source_channel = "basalam", "basalam"
-                    ext_id, ext_mkt = bs_id, "basalam"
-                elif cv == "checkout":
-                    order_source, source_channel = "website", "woocommerce_checkout"
-                    ext_id, ext_mkt = None, None
-                elif cv == "admin":
-                    order_source, source_channel = "manual", "admin"
-                    ext_id, ext_mkt = None, None
-                else:
-                    order_source, source_channel = "unknown", cv or None
-                    ext_id, ext_mkt = None, None
+                cv    = op_map.get(oid, "")
+                order_source_v, src_ch, ext_id, ext_mkt = _resolve_src(bs_id, cv)
                 orders.append({
-                    "id": oid,
-                    "status": st[3:] if st.startswith("wc-") else st,
-                    "currency": r["currency"],
-                    "total": _float(r["total_amount"]),
-                    "tax_total": _float(r["tax_amount"]),
-                    "customer_id": _int(r["customer_id"]),
-                    "billing_email": r["billing_email"],
-                    "date_created": _dt(r["date_created_gmt"]),
-                    "date_modified": _dt(r["date_updated_gmt"]),
-                    "payment_method": r["payment_method"],
+                    "id":                   oid,
+                    "status":               st[3:] if st.startswith("wc-") else st,
+                    "currency":             r["currency"],
+                    "total":                _float(r["total_amount"]),
+                    "tax_total":            _float(r["tax_amount"]),
+                    "customer_id":          _int(r["customer_id"]),
+                    "billing_email":        email,
+                    "email_masked":         _mask_email(email),
+                    "has_email":            bool(email),
+                    "phone_masked":         _mask_phone(phone),
+                    "has_phone":            bool(phone),
+                    "date_created":         _dt(r["date_created_gmt"]),
+                    "date_modified":        _dt(r["date_updated_gmt"]),
+                    "payment_method":       r["payment_method"],
                     "payment_method_title": r["payment_method_title"],
-                    "transaction_id": r["transaction_id"],
-                    "order_source": order_source,
-                    "source_channel": source_channel,
-                    "external_order_id": ext_id,
+                    "transaction_id":       r["transaction_id"],
+                    "order_source":         order_source_v,
+                    "source_channel":       src_ch,
+                    "external_order_id":    ext_id,
                     "external_marketplace": ext_mkt,
-                    "created_via": cv or None,
+                    "created_via":          cv or None,
                 })
     return _ok(orders, pagination=_paginate(total, page, per_page))
+
+
+@data_api.get("/orders/unpaid")
+@require_api_key
+def list_orders_unpaid():
+    """Recovery candidates: pending, failed, and on-hold orders.
+
+    Returns PII-masked contact fields only. Includes age_minutes and recovery reason.
+    Filters: order_source, external_marketplace, date_from, date_to
+    """
+    page, per_page = _page_params()
+    offset = (page - 1) * per_page
+
+    order_source         = request.args.get("order_source") or request.args.get("source")
+    external_marketplace = request.args.get("external_marketplace")
+    date_from            = request.args.get("date_from") or request.args.get("date_after")
+    date_to              = request.args.get("date_to") or request.args.get("date_before")
+
+    where:  list[str] = ["o.type = 'shop_order'", "o.status IN ('wc-pending','wc-failed','wc-on-hold')"]
+    params: list      = []
+
+    if date_from:
+        where.append("o.date_created_gmt >= %s")
+        params.append(date_from)
+    if date_to:
+        where.append("o.date_created_gmt <= %s")
+        params.append(date_to)
+
+    _bs_sub = "SELECT order_id FROM wp_wc_orders_meta WHERE meta_key='_sync_basalam_hash_id'"
+    if order_source == "basalam" or external_marketplace == "basalam":
+        where.append(f"o.id IN ({_bs_sub})")
+    elif order_source and order_source != "basalam":
+        where.append(f"o.id NOT IN ({_bs_sub})")
+
+    where_sql = " AND ".join(where)
+
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT COUNT(*) as cnt FROM wp_wc_orders o WHERE {where_sql}", params
+            )
+            total = cur.fetchone()["cnt"]
+            cur.execute(
+                f"""SELECT o.id, o.status, o.currency, o.total_amount, o.customer_id,
+                           o.billing_email, o.date_created_gmt, o.payment_method
+                    FROM wp_wc_orders o
+                    WHERE {where_sql}
+                    ORDER BY o.date_created_gmt ASC
+                    LIMIT %s OFFSET %s""",
+                params + [per_page, offset],
+            )
+            rows      = cur.fetchall()
+            order_ids = [r["id"] for r in rows]
+            src_map, op_map, phone_map = _batch_src(cur, order_ids)
+
+            now_utc = datetime.now(timezone.utc)
+            orders = []
+            for r in rows:
+                st    = r["status"]
+                oid   = r["id"]
+                email = r["billing_email"] or None
+                phone = phone_map.get(oid) or None
+                bs_id = src_map.get(oid)
+                cv    = op_map.get(oid, "")
+                order_source_v, src_ch, ext_id, ext_mkt = _resolve_src(bs_id, cv)
+
+                # Age calculation
+                created = r["date_created_gmt"]
+                age_minutes: int | None = None
+                if created:
+                    try:
+                        if isinstance(created, datetime):
+                            delta = now_utc - created.replace(tzinfo=timezone.utc)
+                        else:
+                            dt = datetime.fromisoformat(str(created))
+                            delta = now_utc - dt.replace(tzinfo=timezone.utc)
+                        age_minutes = int(delta.total_seconds() / 60)
+                    except Exception:
+                        age_minutes = None
+
+                st_clean = st[3:] if st.startswith("wc-") else st
+                orders.append({
+                    "id":                   oid,
+                    "status":               st_clean,
+                    "currency":             r["currency"],
+                    "total":                _float(r["total_amount"]),
+                    "customer_id":          _int(r["customer_id"]),
+                    "email_masked":         _mask_email(email),
+                    "has_email":            bool(email),
+                    "phone_masked":         _mask_phone(phone),
+                    "has_phone":            bool(phone),
+                    "date_created":         _dt(r["date_created_gmt"]),
+                    "payment_method":       r["payment_method"],
+                    "order_source":         order_source_v,
+                    "source_channel":       src_ch,
+                    "external_order_id":    ext_id,
+                    "external_marketplace": ext_mkt,
+                    "age_minutes":          age_minutes,
+                    "age_hours":            round(age_minutes / 60, 1) if age_minutes is not None else None,
+                    "recovery_reason":      _UNPAID_REASON.get(st, "unpaid"),
+                })
+    return _ok(orders, pagination=_paginate(total, page, per_page))
+
+
+@data_api.get("/analytics/orders-summary")
+@require_api_key
+def orders_summary():
+    """Order count/total summary by status and source.
+
+    Filters: date_from, date_to (applied to date_created_gmt)
+    """
+    date_from = request.args.get("date_from") or request.args.get("date_after")
+    date_to   = request.args.get("date_to") or request.args.get("date_before")
+
+    date_where  = ""
+    date_params: list = []
+    if date_from:
+        date_where += " AND date_created_gmt >= %s"
+        date_params.append(date_from)
+    if date_to:
+        date_where += " AND date_created_gmt <= %s"
+        date_params.append(date_to)
+
+    with _db() as conn:
+        with conn.cursor() as cur:
+            # Total orders
+            cur.execute(
+                f"SELECT COUNT(*) as cnt, SUM(total_amount) as total_sales"
+                f" FROM wp_wc_orders WHERE type='shop_order'{date_where}",
+                date_params,
+            )
+            totals = cur.fetchone()
+
+            # Count by status
+            cur.execute(
+                f"SELECT status, COUNT(*) as cnt FROM wp_wc_orders"
+                f" WHERE type='shop_order'{date_where} GROUP BY status ORDER BY cnt DESC",
+                date_params,
+            )
+            by_status = [
+                {"status": (r["status"][3:] if r["status"].startswith("wc-") else r["status"]),
+                 "raw_status": r["status"], "count": r["cnt"]}
+                for r in cur.fetchall()
+            ]
+
+            # Unpaid / recovery candidates
+            cur.execute(
+                f"SELECT COUNT(*) as cnt FROM wp_wc_orders"
+                f" WHERE type='shop_order' AND status IN ('wc-pending','wc-failed','wc-on-hold'){date_where}",
+                date_params,
+            )
+            unpaid_count = cur.fetchone()["cnt"]
+
+            # Basalam orders
+            bs_ids_query = (
+                f"SELECT DISTINCT order_id FROM wp_wc_orders_meta WHERE meta_key='_sync_basalam_hash_id'"
+            )
+            cur.execute(
+                f"SELECT COUNT(*) as cnt, SUM(o.total_amount) as total_sales"
+                f" FROM wp_wc_orders o WHERE o.type='shop_order'"
+                f" AND o.id IN ({bs_ids_query}){date_where}",
+                date_params,
+            )
+            bs_row = cur.fetchone()
+            basalam_count = bs_row["cnt"]
+            basalam_sales = _float(bs_row["total_sales"])
+
+            # Website (checkout) orders
+            cur.execute(
+                f"SELECT COUNT(*) as cnt, SUM(o.total_amount) as total_sales"
+                f" FROM wp_wc_orders o"
+                f" JOIN wp_wc_order_operational_data op ON op.order_id=o.id"
+                f" WHERE o.type='shop_order' AND op.created_via='checkout'"
+                f" AND o.id NOT IN ({bs_ids_query}){date_where}",
+                date_params,
+            )
+            web_row = cur.fetchone()
+            website_count = web_row["cnt"]
+            website_sales = _float(web_row["total_sales"])
+
+            # Manual (admin) orders
+            cur.execute(
+                f"SELECT COUNT(*) as cnt, SUM(o.total_amount) as total_sales"
+                f" FROM wp_wc_orders o"
+                f" JOIN wp_wc_order_operational_data op ON op.order_id=o.id"
+                f" WHERE o.type='shop_order' AND op.created_via='admin'"
+                f" AND o.id NOT IN ({bs_ids_query}){date_where}",
+                date_params,
+            )
+            adm_row = cur.fetchone()
+            manual_count = adm_row["cnt"]
+            manual_sales = _float(adm_row["total_sales"])
+
+            # Contact availability
+            cur.execute(
+                f"SELECT"
+                f" SUM(CASE WHEN o.billing_email IS NOT NULL AND o.billing_email != '' THEN 1 ELSE 0 END) as has_email,"
+                f" COUNT(*) as total"
+                f" FROM wp_wc_orders o WHERE o.type='shop_order'{date_where}",
+                date_params,
+            )
+            contact_row = cur.fetchone()
+            has_email_count = contact_row["has_email"] or 0
+
+            cur.execute(
+                f"SELECT COUNT(DISTINCT a.order_id) as has_phone"
+                f" FROM wp_wc_order_addresses a"
+                f" JOIN wp_wc_orders o ON o.id=a.order_id"
+                f" WHERE o.type='shop_order' AND a.address_type='billing'"
+                f" AND a.phone IS NOT NULL AND a.phone != ''"
+                f"{date_where.replace('date_created_gmt', 'o.date_created_gmt')}",
+                date_params,
+            )
+            has_phone_count = cur.fetchone()["has_phone"] or 0
+
+    total_count = int(totals["cnt"] or 0)
+    total_sales = _float(totals["total_sales"])
+    unknown_count = total_count - int(basalam_count) - int(website_count) - int(manual_count)
+
+    return _ok({
+        "total_orders":   total_count,
+        "total_sales":    total_sales,
+        "unpaid_count":   unpaid_count,
+        "by_status":      by_status,
+        "by_source": {
+            "basalam":  {"count": int(basalam_count), "total_sales": basalam_sales},
+            "website":  {"count": int(website_count), "total_sales": website_sales},
+            "manual":   {"count": int(manual_count),  "total_sales": manual_sales},
+            "unknown":  {"count": max(0, unknown_count), "total_sales": None},
+        },
+        "contact_availability": {
+            "has_email": int(has_email_count),
+            "has_phone": int(has_phone_count),
+            "total":     total_count,
+        },
+        "filters_applied": {
+            "date_from": date_from,
+            "date_to":   date_to,
+        },
+    })
 
 
 @data_api.get("/orders/<int:oid>")
