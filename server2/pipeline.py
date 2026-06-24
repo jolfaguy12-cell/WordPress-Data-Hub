@@ -1430,6 +1430,7 @@ def _apply_order_delete(cur, order_id: int) -> None:
     cur.execute(f"DELETE FROM {prefix}woocommerce_order_items WHERE order_id = %s", (order_id,))
     cur.execute(f"DELETE FROM {prefix}wc_orders_meta WHERE order_id = %s", (order_id,))
     cur.execute(f"DELETE FROM {prefix}wc_order_addresses WHERE order_id = %s", (order_id,))
+    cur.execute(f"DELETE FROM {prefix}wc_order_operational_data WHERE order_id = %s", (order_id,))
     cur.execute(f"DELETE FROM {prefix}wc_orders WHERE id = %s", (order_id,))
 
 
@@ -1504,6 +1505,20 @@ def _apply_order_upsert(cur, snapshot: dict) -> None:
             f"INSERT INTO {prefix}wc_order_addresses (order_id, {acol_sql}) VALUES (%s, {aph_sql})",
             [order_id] + avals,
         )
+
+    # Upsert HPOS operational data (created_via, order_key, date_paid, etc.)
+    op = snapshot.get("operational_data")
+    if op:
+        op_cols = [c for c in op.keys() if op[c] is not None or c in ("created_via", "order_key")]
+        if op_cols:
+            op_set  = ", ".join(f"`{c}` = %s" for c in op_cols)
+            op_vals = [op[c] for c in op_cols]
+            cur.execute(
+                f"INSERT INTO {prefix}wc_order_operational_data (order_id, {', '.join(f'`{c}`' for c in op_cols)})"
+                f" VALUES (%s, {', '.join(['%s'] * len(op_cols))})"
+                f" ON DUPLICATE KEY UPDATE {op_set}",
+                [order_id] + op_vals + op_vals,
+            )
 
 
 def _apply_term_upsert(cur, snap: dict) -> None:

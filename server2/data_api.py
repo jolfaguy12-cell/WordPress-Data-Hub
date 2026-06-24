@@ -402,26 +402,110 @@ def _order_addresses(cur, order_id: int) -> dict:
     return result
 
 
-def _build_order(order: dict, meta: dict, items: list, addresses: dict | None = None) -> dict:
+def _order_operational_data(cur, order_id: int) -> dict:
+    cur.execute(
+        "SELECT created_via, woocommerce_version, order_key,"
+        " date_paid_gmt, date_completed_gmt,"
+        " shipping_total_amount, discount_total_amount"
+        " FROM wp_wc_order_operational_data WHERE order_id=%s",
+        (order_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return {}
+    return {
+        "created_via": row.get("created_via") or None,
+        "order_key": row.get("order_key"),
+        "date_paid": _dt(row.get("date_paid_gmt")),
+        "date_completed": _dt(row.get("date_completed_gmt")),
+        "shipping_total": _float(row.get("shipping_total_amount")),
+        "discount_total": _float(row.get("discount_total_amount")),
+    }
+
+
+def _order_source(meta: dict, op_data: dict) -> dict:
+    """Derive order source/channel from meta and operational data."""
+    basalam_id = meta.get("_sync_basalam_hash_id")
+    if basalam_id:
+        source_meta: dict = {}
+        for k in ("_basalam_fee_amount", "_basalam_balance_amount", "_basalam_purchase_count"):
+            if k in meta:
+                source_meta[k.lstrip("_")] = meta[k]
+        for k, v in meta.items():
+            if k.startswith("_sync_basalam_item_id_"):
+                source_meta[k.lstrip("_")] = v
+        return {
+            "order_source":          "basalam",
+            "source_channel":        "basalam",
+            "external_order_id":     basalam_id,
+            "external_marketplace":  "basalam",
+            "created_via":           op_data.get("created_via"),
+            "source_meta":           source_meta or None,
+        }
+
+    created_via = op_data.get("created_via") or ""
+    if created_via == "checkout":
+        return {
+            "order_source":         "website",
+            "source_channel":       "woocommerce_checkout",
+            "external_order_id":    None,
+            "external_marketplace": None,
+            "created_via":          created_via,
+            "source_meta":          None,
+        }
+    if created_via == "admin":
+        return {
+            "order_source":         "manual",
+            "source_channel":       "admin",
+            "external_order_id":    None,
+            "external_marketplace": None,
+            "created_via":          created_via,
+            "source_meta":          None,
+        }
+    return {
+        "order_source":         "unknown",
+        "source_channel":       created_via or None,
+        "external_order_id":    None,
+        "external_marketplace": None,
+        "created_via":          created_via or None,
+        "source_meta":          None,
+    }
+
+
+def _build_order(order: dict, meta: dict, items: list,
+                 addresses: dict | None = None, op_data: dict | None = None) -> dict:
     status = order.get("status", "")
     if status.startswith("wc-"):
         status = status[3:]
-    addrs = addresses or {}
+    addrs  = addresses or {}
+    op     = op_data or {}
+    source = _order_source(meta, op)
     return {
         "id": order["id"],
         "status": status,
         "currency": order.get("currency"),
         "date_created": _dt(order.get("date_created_gmt")),
         "date_modified": _dt(order.get("date_updated_gmt")),
+        "date_paid": op.get("date_paid"),
+        "date_completed": op.get("date_completed"),
         "total": _float(order.get("total_amount")),
         "tax_total": _float(order.get("tax_amount")),
+        "shipping_total": op.get("shipping_total"),
+        "discount_total": op.get("discount_total"),
         "customer_id": _int(order.get("customer_id")),
         "customer_note": order.get("customer_note"),
         "billing_email": order.get("billing_email"),
         "payment_method": order.get("payment_method"),
         "payment_method_title": order.get("payment_method_title"),
         "transaction_id": order.get("transaction_id"),
+        "order_key": op.get("order_key"),
         "parent_order_id": _int(order.get("parent_order_id")) or None,
+        "order_source": source["order_source"],
+        "source_channel": source["source_channel"],
+        "external_order_id": source["external_order_id"],
+        "external_marketplace": source["external_marketplace"],
+        "created_via": source["created_via"],
+        "source_meta": source["source_meta"],
         "billing": addrs.get("billing", {k: None for k in _ADDR_FIELDS}),
         "shipping": addrs.get("shipping", {k: None for k in _ADDR_FIELDS}),
         "line_items": [i for i in items if i["type"] == "line_item"],
@@ -871,11 +955,48 @@ def list_orders():
                     ORDER BY id DESC LIMIT %s OFFSET %s""",
                 params + [per_page, offset],
             )
+            rows = cur.fetchall()
+            order_ids = [r["id"] for r in rows]
+            # Batch-fetch source info for listed orders
+            src_map: dict = {}
+            if order_ids:
+                id_ph = ",".join(["%s"] * len(order_ids))
+                cur.execute(
+                    f"SELECT order_id, meta_key, meta_value FROM wp_wc_orders_meta"
+                    f" WHERE order_id IN ({id_ph}) AND meta_key = '_sync_basalam_hash_id'",
+                    order_ids,
+                )
+                for sm in cur.fetchall():
+                    src_map[sm["order_id"]] = sm["meta_value"]
+                cur.execute(
+                    f"SELECT order_id, created_via FROM wp_wc_order_operational_data"
+                    f" WHERE order_id IN ({id_ph})",
+                    order_ids,
+                )
+                op_map = {r["order_id"]: r["created_via"] for r in cur.fetchall()}
+            else:
+                op_map = {}
+
             orders = []
-            for r in cur.fetchall():
-                st = r["status"]
+            for r in rows:
+                st  = r["status"]
+                oid = r["id"]
+                bs_id = src_map.get(oid)
+                cv    = op_map.get(oid) or ""
+                if bs_id:
+                    order_source, source_channel = "basalam", "basalam"
+                    ext_id, ext_mkt = bs_id, "basalam"
+                elif cv == "checkout":
+                    order_source, source_channel = "website", "woocommerce_checkout"
+                    ext_id, ext_mkt = None, None
+                elif cv == "admin":
+                    order_source, source_channel = "manual", "admin"
+                    ext_id, ext_mkt = None, None
+                else:
+                    order_source, source_channel = "unknown", cv or None
+                    ext_id, ext_mkt = None, None
                 orders.append({
-                    "id": r["id"],
+                    "id": oid,
                     "status": st[3:] if st.startswith("wc-") else st,
                     "currency": r["currency"],
                     "total": _float(r["total_amount"]),
@@ -887,6 +1008,11 @@ def list_orders():
                     "payment_method": r["payment_method"],
                     "payment_method_title": r["payment_method_title"],
                     "transaction_id": r["transaction_id"],
+                    "order_source": order_source,
+                    "source_channel": source_channel,
+                    "external_order_id": ext_id,
+                    "external_marketplace": ext_mkt,
+                    "created_via": cv or None,
                 })
     return _ok(orders, pagination=_paginate(total, page, per_page))
 
@@ -900,10 +1026,11 @@ def get_order(oid):
             order = cur.fetchone()
             if not order:
                 return _err("not_found", f"Order {oid} not found.", 404)
-            meta = _order_meta(cur, oid)
-            items = _order_items(cur, oid)
+            meta      = _order_meta(cur, oid)
+            items     = _order_items(cur, oid)
             addresses = _order_addresses(cur, oid)
-    return _ok(_build_order(order, meta, items, addresses))
+            op_data   = _order_operational_data(cur, oid)
+    return _ok(_build_order(order, meta, items, addresses, op_data))
 
 
 @data_api.get("/orders/<int:oid>/items")
