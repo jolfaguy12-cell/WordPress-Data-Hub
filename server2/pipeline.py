@@ -1429,6 +1429,7 @@ def _apply_order_delete(cur, order_id: int) -> None:
         cur.execute(f"DELETE FROM {prefix}woocommerce_order_itemmeta WHERE order_item_id IN ({ph})", item_ids)
     cur.execute(f"DELETE FROM {prefix}woocommerce_order_items WHERE order_id = %s", (order_id,))
     cur.execute(f"DELETE FROM {prefix}wc_orders_meta WHERE order_id = %s", (order_id,))
+    cur.execute(f"DELETE FROM {prefix}wc_order_addresses WHERE order_id = %s", (order_id,))
     cur.execute(f"DELETE FROM {prefix}wc_orders WHERE id = %s", (order_id,))
 
 
@@ -1491,6 +1492,18 @@ def _apply_order_upsert(cur, snapshot: dict) -> None:
                 f"INSERT INTO {prefix}woocommerce_order_itemmeta (order_item_id, meta_key, meta_value) VALUES {im_ph}",
                 im_vals,
             )
+
+    # Replace HPOS billing/shipping addresses
+    cur.execute(f"DELETE FROM {prefix}wc_order_addresses WHERE order_id = %s", (order_id,))
+    for addr in snapshot.get("addresses", []):
+        acols = list(addr.keys())
+        avals = [addr[c] for c in acols]
+        acol_sql = ", ".join(f"`{c}`" for c in acols)
+        aph_sql  = ", ".join(["%s"] * len(acols))
+        cur.execute(
+            f"INSERT INTO {prefix}wc_order_addresses (order_id, {acol_sql}) VALUES (%s, {aph_sql})",
+            [order_id] + avals,
+        )
 
 
 def _apply_term_upsert(cur, snap: dict) -> None:

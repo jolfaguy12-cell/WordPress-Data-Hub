@@ -381,18 +381,32 @@ def _order_items(cur, order_id: int) -> list:
     return result
 
 
-def _build_address(meta: dict, prefix: str) -> dict:
-    return {k: meta.get(f"_{prefix}_{k}") for k in (
-        "first_name", "last_name", "company",
-        "address_1", "address_2", "city", "state",
-        "postcode", "country", "phone", "email",
-    )}
+_ADDR_FIELDS = ("first_name", "last_name", "company", "address_1", "address_2",
+                "city", "state", "postcode", "country", "phone", "email")
 
 
-def _build_order(order: dict, meta: dict, items: list) -> dict:
+def _order_addresses(cur, order_id: int) -> dict:
+    cur.execute(
+        "SELECT address_type, first_name, last_name, company, address_1, address_2,"
+        " city, state, postcode, country, email, phone"
+        " FROM wp_wc_order_addresses WHERE order_id=%s",
+        (order_id,),
+    )
+    result: dict = {}
+    for row in cur.fetchall():
+        atype = row.pop("address_type", None) if isinstance(row, dict) else row["address_type"]
+        if isinstance(row, dict):
+            result[atype] = {k: row.get(k) for k in _ADDR_FIELDS}
+        else:
+            result[atype] = dict(zip(_ADDR_FIELDS, row[1:]))
+    return result
+
+
+def _build_order(order: dict, meta: dict, items: list, addresses: dict | None = None) -> dict:
     status = order.get("status", "")
     if status.startswith("wc-"):
         status = status[3:]
+    addrs = addresses or {}
     return {
         "id": order["id"],
         "status": status,
@@ -408,8 +422,8 @@ def _build_order(order: dict, meta: dict, items: list) -> dict:
         "payment_method_title": order.get("payment_method_title"),
         "transaction_id": order.get("transaction_id"),
         "parent_order_id": _int(order.get("parent_order_id")) or None,
-        "billing": _build_address(meta, "billing"),
-        "shipping": _build_address(meta, "shipping"),
+        "billing": addrs.get("billing", {k: None for k in _ADDR_FIELDS}),
+        "shipping": addrs.get("shipping", {k: None for k in _ADDR_FIELDS}),
         "line_items": [i for i in items if i["type"] == "line_item"],
         "shipping_lines": [i for i in items if i["type"] == "shipping"],
         "fee_lines": [i for i in items if i["type"] == "fee"],
@@ -888,7 +902,8 @@ def get_order(oid):
                 return _err("not_found", f"Order {oid} not found.", 404)
             meta = _order_meta(cur, oid)
             items = _order_items(cur, oid)
-    return _ok(_build_order(order, meta, items))
+            addresses = _order_addresses(cur, oid)
+    return _ok(_build_order(order, meta, items, addresses))
 
 
 @data_api.get("/orders/<int:oid>/items")
