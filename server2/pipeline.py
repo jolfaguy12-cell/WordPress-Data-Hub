@@ -315,6 +315,34 @@ def _run_streaming_export(cfg: dict, job_id: str) -> pathlib.Path:
     archive_dir  = pathlib.Path(cfg["archive_storage_path"]) / job_id
     archive_dir.mkdir(parents=True, exist_ok=True)
     archive_path = archive_dir / f"{job_id}.sql.gz"
+    meta_path    = archive_dir / "meta.json"
+
+    # If a prior session already completed streaming for this job, reuse the archive
+    # rather than overwriting it.  Opening in "wb" mode on re-attach would truncate
+    # the archive to only the chunks sent after re-attachment, producing a partial SQL
+    # dump that fails at import.
+    if archive_path.exists() and meta_path.exists():
+        try:
+            prev_meta = json.loads(meta_path.read_text())
+            if prev_meta.get("checksum"):
+                print(f"[stream] Archive already streamed for job {job_id} — reusing.")
+                print(f"[stream] Archive: {archive_path}")
+                return archive_dir
+        except Exception:
+            pass
+
+    # Guard: if the archive exists but streaming wasn't completed (no checksum in
+    # meta.json), the prior session was interrupted mid-stream.  Re-attaching and
+    # overwriting would produce a partial dump (chunks from the re-attach point only;
+    # all earlier chunks are permanently lost from the server queue).  Fail loudly.
+    if archive_path.exists() and archive_path.stat().st_size > 0:
+        raise RuntimeError(
+            f"[stream] Archive {archive_path} exists but is incomplete "
+            f"(prior session was interrupted mid-stream). "
+            f"The WP server has already consumed those chunks — they cannot be "
+            f"retrieved.  To restart: delete '{archive_dir}' and cancel/expire "
+            f"job {job_id} on the WP side, then start a fresh export."
+        )
 
     print(f"[stream] Streaming export for job {job_id} …")
     print(f"[stream] Archive: {archive_path}")
