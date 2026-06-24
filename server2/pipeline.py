@@ -786,7 +786,8 @@ MEDIA_LOCAL_TABLE_MIGRATIONS = [
 ]
 
 
-def _media_conn(cfg: dict):
+def _mirror_conn(cfg: dict):
+    """Open a connection to the WordPress mirror DB (replaces _media_conn)."""
     db = cfg["mirror_db"]
     return pymysql.connect(
         host=db["host"],
@@ -796,12 +797,90 @@ def _media_conn(cfg: dict):
         database=db["name"],
         charset="utf8mb4",
         autocommit=True,
-        init_command="SET sql_mode=''",  # allow zero dates mirrored from WordPress
+        init_command="SET sql_mode=''",
     )
 
 
+def _hub_db_name(cfg: dict) -> str:
+    """Name of the persistent hub-state DB (never swapped or dropped by export)."""
+    return cfg.get("hub_state_db", {}).get("name", "behdashtik_hub_state")
+
+
+def _hub_conn(cfg: dict):
+    """Open a connection to the persistent hub-state DB, creating it if needed."""
+    db   = cfg["mirror_db"]  # same host/creds; different DB name
+    name = _hub_db_name(cfg)
+    # Create the DB if it doesn't exist yet (idempotent), and ensure the
+    # readonly user (used by the Data API) can also read from it.
+    admin = pymysql.connect(
+        host=db["host"], port=db.get("port", 3306),
+        user=db["user"], password=db["password"],
+        charset="utf8mb4",
+    )
+    try:
+        with admin.cursor() as cur:
+            cur.execute(
+                f"CREATE DATABASE IF NOT EXISTS `{name}` "
+                "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+            )
+            ro_user = db.get("readonly_user")
+            if ro_user:
+                try:
+                    cur.execute(
+                        f"GRANT SELECT ON `{name}`.* TO %s",
+                        (ro_user,),
+                    )
+                except Exception:
+                    pass  # user may not exist; non-fatal
+    finally:
+        admin.close()
+    return pymysql.connect(
+        host=db["host"],
+        port=db.get("port", 3306),
+        user=db["user"],
+        password=db["password"],
+        database=name,
+        charset="utf8mb4",
+        autocommit=True,
+        init_command="SET sql_mode=''",
+    )
+
+
+def _migrate_hub_tables_if_needed(cfg: dict) -> None:
+    """One-time: copy bdsk_local_media_index + bdsk_event_log from mirror to hub
+    if the hub tables are empty and the mirror tables have rows.  Safe to re-run."""
+    mirror_name = cfg["mirror_db"]["name"]
+    hub_name    = _hub_db_name(cfg)
+    if mirror_name == hub_name:
+        return  # already the same DB; nothing to migrate
+    try:
+        with _hub_conn(cfg) as conn:
+            with conn.cursor() as cur:
+                for table in ("bdsk_local_media_index", "bdsk_event_log"):
+                    cur.execute(f"SELECT COUNT(*) FROM `{table}`")
+                    hub_count = cur.fetchone()[0]
+                    if hub_count > 0:
+                        continue  # already has data
+                    # Check source
+                    try:
+                        cur.execute(
+                            f"SELECT COUNT(*) FROM `{mirror_name}`.`{table}`"
+                        )
+                        src_count = cur.fetchone()[0]
+                    except Exception:
+                        continue  # mirror table doesn't exist; nothing to migrate
+                    if src_count == 0:
+                        continue
+                    cur.execute(
+                        f"INSERT INTO `{table}` SELECT * FROM `{mirror_name}`.`{table}`"
+                    )
+                    print(f"[hub] Migrated {src_count} rows from mirror.{table} → hub.{table}")
+    except Exception as exc:
+        print(f"[hub] WARNING: migration check failed (non-fatal): {exc}")
+
+
 def setup_media_local_table(cfg: dict) -> None:
-    with _media_conn(cfg) as conn:
+    with _hub_conn(cfg) as conn:
         with conn.cursor() as cur:
             cur.execute(MEDIA_LOCAL_TABLE_SQL)
             # Find existing columns and apply only the missing additive migrations
@@ -812,6 +891,7 @@ def setup_media_local_table(cfg: dict) -> None:
                 col = clause.split()[2]  # "ADD COLUMN <name> ..."
                 if col not in have:
                     cur.execute(f"ALTER TABLE bdsk_local_media_index {clause}")
+    _migrate_hub_tables_if_needed(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -848,21 +928,25 @@ def _resolve_variation_parent(cur, variation_id: int) -> int:
     return int(row[0]) if row and row[0] else 0
 
 
-def _upsert_local_media(cur, item: dict) -> None:
+def _upsert_local_media(hub_cur, item: dict, mirror_cur=None) -> None:
     image_type = item["image_type"]
     role       = _ROLE_BY_IMAGE_TYPE.get(image_type, "other")
 
     # The WP index stores product_id = variation post id for variation images.
     # Record the variation id separately and resolve the owning product so the
     # Hub can present products/{product_id}/variations/{variation_id}/.
+    # mirror_cur (connection to WordPress mirror DB) is needed for this lookup;
+    # without it the parent defaults to 0.
     raw_pid      = item.get("product_id") or 0
     product_id   = raw_pid
     variation_id = 0
-    if image_type == "variation" and raw_pid:
+    if image_type == "variation" and raw_pid and mirror_cur is not None:
         variation_id = raw_pid
-        product_id   = _resolve_variation_parent(cur, raw_pid)
+        product_id   = _resolve_variation_parent(mirror_cur, raw_pid)
+    elif image_type == "variation" and raw_pid:
+        variation_id = raw_pid
 
-    cur.execute(
+    hub_cur.execute(
         """
         INSERT INTO bdsk_local_media_index
           (manifest_id, attachment_id, product_id, order_id, variation_id, role, image_type,
@@ -1025,6 +1109,11 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
         print("[media] Media sync disabled in config.")
         return
 
+    # Guard: don't run while a staging DB swap is in progress
+    if _staging_db_exists(cfg):
+        print("[media] Staging DB swap in progress — skipping media sync this cycle.")
+        return
+
     media_base    = pathlib.Path(media_cfg.get("storage_path", "/root/wordpress-data-hub/data/media"))
     # Throttling: concurrency default 1, hard-capped at 2.
     concurrency   = max(1, min(2, int(media_cfg.get("concurrency", 1))))
@@ -1066,8 +1155,10 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
     after_id     = 0
     total_items  = 0
 
-    with _media_conn(cfg) as conn:
-        with conn.cursor() as cur:
+    # hub_conn writes to persistent hub-state DB; mirror_conn reads wp_posts for
+    # variation parent resolution (wp_posts lives in the mirror DB, not hub state).
+    with _hub_conn(cfg) as hub_conn, _mirror_conn(cfg) as mirror_conn:
+        with hub_conn.cursor() as hub_cur, mirror_conn.cursor() as mirror_cur:
             while True:
                 page = _fetch_manifest_page(
                     cfg, after_id, page_limit, modified_since, include_deleted=True
@@ -1077,7 +1168,7 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
                     break
 
                 for item in items:
-                    _upsert_local_media(cur, item)
+                    _upsert_local_media(hub_cur, item, mirror_cur)
 
                 total_items += len(items)
                 after_id = page.get("next_after_id") or 0
@@ -1089,7 +1180,7 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
     print(f"\n[media] Manifest sync complete: {total_items} entries processed.")
 
     # ---- Phase 2: handle deletions ----
-    with _media_conn(cfg) as conn:
+    with _hub_conn(cfg) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -1114,7 +1205,7 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
     # ---- Phase 3: determine download queue ----
     # Bound retries: rows that have failed >= dl_giveup times are not re-queued
     # (they stay 'failed' with last_error) so failed work cannot grow unbounded.
-    with _media_conn(cfg) as conn:
+    with _hub_conn(cfg) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -1187,7 +1278,7 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
             res  = future.result()
             dest = _local_path_for(media_base, item)
 
-            with _media_conn(cfg) as conn:
+            with _hub_conn(cfg) as conn:
                 with conn.cursor() as cur:
                     if res["skipped"]:
                         cur.execute(
@@ -1253,7 +1344,7 @@ CREATE TABLE IF NOT EXISTS bdsk_event_log (
 
 
 def setup_event_log_table(cfg: dict) -> None:
-    with _media_conn(cfg) as conn:
+    with _hub_conn(cfg) as conn:
         with conn.cursor() as cur:
             cur.execute(EVENT_LOG_TABLE_SQL)
 
@@ -1934,7 +2025,7 @@ def run_event_sync(cfg: dict) -> None:
 
     log_rows: list[dict] = []
 
-    with _media_conn(cfg) as conn:
+    with _mirror_conn(cfg) as conn:
         conn.autocommit(False)
         for (entity_type, entity_id), ev in seen.items():
             event_type = ev["event_type"]
@@ -2013,9 +2104,9 @@ def run_event_sync(cfg: dict) -> None:
                 "mirror_update_status": status, "error_message": error_msg,
             })
 
-    # Write event log rows
+    # Write event log rows (to persistent hub-state DB, not the mirror)
     if log_rows:
-        with _media_conn(cfg) as conn:
+        with _hub_conn(cfg) as conn:
             with conn.cursor() as cur:
                 for lr in log_rows:
                     cur.execute(
@@ -2051,16 +2142,7 @@ def get_status_data(cfg: dict) -> dict:
     # Mirror DB: latest export job
     latest_job = None
     try:
-        with _media_conn(cfg) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT job_id, status, created_at, finished_at FROM bdsk_local_media_index LIMIT 0"
-                )
-    except Exception:
-        pass
-
-    try:
-        with _media_conn(cfg) as conn:
+        with _mirror_conn(cfg) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT job_id, status, created_at, finished_at "
@@ -2077,13 +2159,13 @@ def get_status_data(cfg: dict) -> dict:
     except Exception:
         pass
 
-    # Mirror DB: media index counts by status
+    # Hub state DB: media index counts by status (hub DB is persistent; survives swaps)
     media_counts: dict = {}
     try:
-        with _media_conn(cfg) as conn:
+        with _hub_conn(cfg) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT status, COUNT(*) FROM bdsk_local_media_index GROUP BY status"
+                    "SELECT download_status, COUNT(*) FROM bdsk_local_media_index GROUP BY download_status"
                 )
                 for s, cnt in cur.fetchall():
                     media_counts[s] = cnt

@@ -69,6 +69,33 @@ def _db():
         conn.close()
 
 
+@contextmanager
+def _hub_db():
+    """Read-only connection to the persistent hub-state DB (bdsk_local_media_index etc.)."""
+    cfg  = current_app.config["PIPELINE_CFG"]
+    db   = cfg["mirror_db"]  # same host/creds
+    name = cfg.get("hub_state_db", {}).get("name", "behdashtik_hub_state")
+    try:
+        conn = pymysql.connect(
+            host=db["host"],
+            port=db.get("port", 3306),
+            user=db.get("readonly_user", db["user"]),
+            password=db.get("readonly_password", db["password"]),
+            database=name,
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+            init_command="SET sql_mode=''",
+        )
+        try:
+            yield conn
+        finally:
+            conn.close()
+    except Exception:
+        # Hub DB may not exist yet (before first media-sync run).  Yield a sentinel
+        # that callers can detect via a flag rather than crashing the request.
+        yield None
+
+
 def _media_base() -> pathlib.Path:
     cfg = current_app.config["PIPELINE_CFG"]
     p = cfg.get("media_sync", {}).get("storage_path", "")
@@ -537,41 +564,61 @@ def get_product_variations(pid):
     return _ok(variations)
 
 
-def _media_mapping_for_product(cur, pid: int) -> dict:
-    """Return { attachment_id: {role, variation_id, sync_status, local_path, checksum} }
-    from the Server 2 media mapping table. Empty if the table doesn't exist yet."""
+def _media_mapping_for_product(hub_conn, pid: int) -> dict:
+    """Return { attachment_id: {role, variation_id, sync_status, local_path, checksum, original_url} }
+    from the persistent hub-state DB. Empty if the hub DB is unavailable."""
+    if hub_conn is None:
+        return {}
     try:
-        cur.execute(
-            "SELECT attachment_id, role, variation_id, download_status, local_path, checksum "
-            "FROM bdsk_local_media_index "
-            "WHERE product_id = %s AND manifest_status = 'active'",
-            (pid,),
-        )
+        with hub_conn.cursor() as cur:
+            cur.execute(
+                "SELECT attachment_id, role, variation_id, download_status, "
+                "local_path, checksum, original_url "
+                "FROM bdsk_local_media_index "
+                "WHERE product_id = %s AND manifest_status = 'active'",
+                (pid,),
+            )
+            out: dict = {}
+            for r in cur.fetchall():
+                out[int(r["attachment_id"])] = {
+                    "role":         r["role"] or None,
+                    "variation_id": int(r["variation_id"]) if r["variation_id"] else None,
+                    "sync_status":  r["download_status"],
+                    "local_path":   r["local_path"],
+                    "checksum":     r["checksum"],
+                    "original_url": r["original_url"],
+                }
+            return out
     except Exception:
         return {}
-    out: dict = {}
-    for r in cur.fetchall():
-        out[int(r["attachment_id"])] = {
-            "role":         r["role"] or None,
-            "variation_id": int(r["variation_id"]) if r["variation_id"] else None,
-            "sync_status":  r["download_status"],
-            "local_path":   r["local_path"],
-            "checksum":     r["checksum"],
-        }
-    return out
 
 
 @data_api.get("/products/<int:pid>/images")
 @require_api_key
 def get_product_images(pid):
-    with _db() as conn:
+    with _db() as conn, _hub_db() as hub_conn:
         with conn.cursor() as cur:
             cur.execute("SELECT ID FROM wp_posts WHERE ID = %s AND post_type = 'product'", (pid,))
             if not cur.fetchone():
                 return _err("not_found", f"Product {pid} not found.", 404)
             meta = _meta_dict(cur, pid)
             images = _product_images(cur, pid, meta)
-            mapping = _media_mapping_for_product(cur, pid)
+            mapping = _media_mapping_for_product(hub_conn, pid)
+
+            # If mirror doesn't have the attachment posts (e.g. test/partial export),
+            # fall back to building image entries from the hub media index directly.
+            if not images and mapping:
+                for att_id, m in sorted(mapping.items()):
+                    images.append({
+                        "id":          att_id,
+                        "title":       None,
+                        "url":         m["original_url"],
+                        "local_path":  m["local_path"],
+                        "file":        None,
+                        "position":    len(images),
+                        "is_thumbnail": m["role"] == "main",
+                    })
+
             for img in images:
                 m = mapping.get(int(img["id"])) if img.get("id") else None
                 img["role"]         = m["role"] if m else None

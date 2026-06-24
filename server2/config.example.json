@@ -12,6 +12,10 @@
     "readonly_user": "mirror_readonly_user",
     "readonly_password": "readonly-password-here"
   },
+  "_comment_hub_state_db": "Optional. Defaults to same host/creds as mirror_db, DB name behdashtik_hub_state. Override only if the hub needs a separate MySQL account.",
+  "hub_state_db": {
+    "name": "behdashtik_hub_state"
+  },
   "poll_interval_seconds": 5,
   "poll_timeout_seconds": 3600,
   "request_timeout_seconds": 60,
