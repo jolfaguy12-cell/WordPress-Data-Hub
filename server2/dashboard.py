@@ -731,7 +731,8 @@ def _reset_fail(ip: str) -> None:
 # Flask app
 # ---------------------------------------------------------------------------
 
-app = Flask(__name__)
+_STATIC_DIR = pathlib.Path(__file__).parent / "static"
+app = Flask(__name__, static_folder=str(_STATIC_DIR), static_url_path="/static")
 app.register_blueprint(data_api_bp)
 
 
@@ -782,7 +783,27 @@ def _require_login():
 # ---------------------------------------------------------------------------
 
 CSS = """
-@import url('https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css');
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("/static/fonts/vazirmatn/Vazirmatn-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("/static/fonts/vazirmatn/Vazirmatn-Medium.woff2") format("woff2");
+  font-weight: 500 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("/static/fonts/vazirmatn/Vazirmatn-Bold.woff2") format("woff2");
+  font-weight: 700 900;
+  font-style: normal;
+  font-display: swap;
+}
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
 body { font-family: "Vazirmatn", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
