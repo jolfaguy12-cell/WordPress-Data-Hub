@@ -659,7 +659,42 @@ def prune_old_archives(cfg: dict) -> None:
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+_WP_PHP_EXPORT_ALLOW_ENV = "BDSK_ALLOW_WP_PHP_EXPORT"
+
+def _assert_wp_php_export_allowed() -> None:
+    """Hard-fail unless the operator explicitly opted in to WP/PHP row-by-row export.
+
+    This export mode asks WordPress/PHP to iterate every table row-by-row and
+    stream the SQL back through REST chunks.  On shared hosting this creates
+    sustained CPU/memory load that is unacceptable for production use.
+
+    To opt in (dev/diagnostic only):
+        export BDSK_ALLOW_WP_PHP_EXPORT=1
+        python3 server2/pipeline.py [--test | --chunk-test]
+    """
+    if os.environ.get(_WP_PHP_EXPORT_ALLOW_ENV) not in ("1", "true", "yes"):
+        print(
+            "\n[BLOCKED] WordPress/PHP row-by-row export is disabled by default.\n"
+            "\n"
+            "  This mode asks WordPress/PHP to scan every DB table row-by-row and\n"
+            "  stream SQL through REST chunks.  On shared hosting it creates heavy\n"
+            "  sustained load and is NOT the recommended baseline-mirror path.\n"
+            "\n"
+            "  Preferred alternatives (see docs):\n"
+            "    A. Server2 direct mysqldump (if remote MySQL access is available)\n"
+            "    B. cPanel/UAPI database backup download\n"
+            "\n"
+            "  To enable WP/PHP export for dev/diagnostic only:\n"
+            f"    export {_WP_PHP_EXPORT_ALLOW_ENV}=1\n"
+            "    python3 server2/pipeline.py [--test | --chunk-test]\n",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
 def run_pipeline(cfg: dict, test_mode: bool = False) -> None:
+    _assert_wp_php_export_allowed()
+
     print("=" * 60)
     print("Behdashtik Mirror Connector — Export Pipeline")
     print(f"Target: {cfg['wp_base_url']}")
@@ -698,6 +733,7 @@ def run_pipeline(cfg: dict, test_mode: bool = False) -> None:
 
 def run_chunk_test(cfg: dict) -> None:
     """Start a streaming job, fetch exactly one chunk, print result. Diagnostic only."""
+    _assert_wp_php_export_allowed()
     print("[chunk-test] Starting streaming export job (test_mode=True) …")
     data = api_post(cfg, "/db-export/start", {"test": True})
     job_id      = data.get("job_id")
@@ -2343,8 +2379,8 @@ def run_status(cfg: dict) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Behdashtik Mirror Connector pipeline")
     parser.add_argument("--health-only",     action="store_true", help="Only run health check")
-    parser.add_argument("--chunk-test",      action="store_true", help="Start a streaming job, fetch one chunk, print result (diagnostic)")
-    parser.add_argument("--test",            action="store_true", help="Use test export (50 rows per table)")
+    parser.add_argument("--chunk-test",      action="store_true", help="Start a streaming job, fetch one chunk, print result (diagnostic) [requires BDSK_ALLOW_WP_PHP_EXPORT=1]")
+    parser.add_argument("--test",            action="store_true", help="Use test export (50 rows per table) [requires BDSK_ALLOW_WP_PHP_EXPORT=1]")
     parser.add_argument("--import-only",     metavar="JOB_DIR",   help="Re-import an already-downloaded archive")
     parser.add_argument("--prune",           action="store_true", help="Prune expired local archives and exit")
     parser.add_argument("--media-sync",      action="store_true", help="Run incremental media file sync")
