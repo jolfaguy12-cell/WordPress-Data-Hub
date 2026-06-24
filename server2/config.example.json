@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy this file to config.json and fill in your values. Never commit config.json.",
+  "_comment": "Copy this file to config.json and fill in your values. Never commit config.json. All values here are overridden by server2/.env when present — prefer .env for new deployments.",
   "wp_base_url": "https://your-wordpress-site.com",
   "api_secret": "your-long-random-secret-here",
   "archive_storage_path": "/datahub/db-archives",

@@ -1,8 +1,11 @@
-# Server 2 secrets
+# Server 2 secrets and environment files
 server2/config.json
 server2/media_sync_state.json
 server2/event_sync_state.json
 server2/hub.db
+server2/.env
+server2/.env.*
+!server2/.env.example
 
 # Runtime data — contains DB dumps (customer password hashes) and media files
 # (possibly payment receipts with bank account info). MUST NEVER be committed.

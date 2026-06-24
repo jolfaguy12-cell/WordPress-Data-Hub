@@ -2,13 +2,12 @@
 Behdashtik Data Hub — Read-Only REST API  (Blueprint: /api/v1)
 
 All endpoints require the header:  X-Hub-API-Key: <key>
-Key is read from config.json → data_api.key  or env var BDSK_DATA_API_KEY.
+Key is read from config.json (or .env BDSK_DATA_API_KEY) via the shared config loader.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import pathlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -26,10 +25,7 @@ data_api = Blueprint("data_api", __name__, url_prefix="/api/v1")
 # ---------------------------------------------------------------------------
 
 def _configured_key() -> str:
-    return (
-        os.environ.get("BDSK_DATA_API_KEY")
-        or current_app.config.get("DATA_API_KEY", "")
-    )
+    return current_app.config.get("DATA_API_KEY", "")
 
 
 def require_api_key(f):

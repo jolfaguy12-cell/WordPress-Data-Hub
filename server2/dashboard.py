@@ -29,7 +29,8 @@ import jinja2
 from flask import (Flask, Response, flash, redirect, render_template,
                    request, session, url_for)
 from data_api import data_api as data_api_bp
-from pipeline import get_status_data, load_config
+from bdsk_config import load_config
+from pipeline import get_status_data
 from werkzeug.security import check_password_hash, generate_password_hash
 
 # ---------------------------------------------------------------------------
@@ -285,10 +286,7 @@ def _init_app() -> None:
     lifetime_h = int(hub.get("session_lifetime_hours", 12))
     app.permanent_session_lifetime = timedelta(hours=lifetime_h)
     app.config["PIPELINE_CFG"] = cfg
-    app.config["DATA_API_KEY"] = (
-        cfg.get("data_api", {}).get("key", "")
-        or os.environ.get("BDSK_DATA_API_KEY", "")
-    )
+    app.config["DATA_API_KEY"] = cfg.get("data_api", {}).get("key", "")
     init_db()
     if count_users() == 0:
         sys.exit(
@@ -1154,4 +1152,9 @@ if __name__ == "__main__":
         cmd_create_user()
     else:
         _init_app()
-        app.run(host="127.0.0.1", port=8089, debug=False)
+        _hub = load_config().get("hub", {})
+        app.run(
+            host=_hub.get("host", "127.0.0.1"),
+            port=int(_hub.get("port", 8089)),
+            debug=False,
+        )

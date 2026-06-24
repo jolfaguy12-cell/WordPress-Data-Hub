@@ -32,22 +32,7 @@ from typing import Any
 
 import pymysql
 import requests
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-CONFIG_PATH = pathlib.Path(__file__).parent / "config.json"
-
-
-def load_config() -> dict:
-    if not CONFIG_PATH.exists():
-        sys.exit(
-            f"[ERROR] config.json not found. Copy config.example.json to config.json and fill in your values.\n"
-            f"Expected path: {CONFIG_PATH}"
-        )
-    with CONFIG_PATH.open() as f:
-        return json.load(f)
+from bdsk_config import load_config, print_config_summary
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +114,8 @@ def api_post(cfg: dict, path: str, body: dict | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 def health_check(cfg: dict) -> dict:
+    print(f"[health] Source URL        : {cfg.get('wp_base_url', '?')}")
+    print(f"[health] Mirror DB         : {cfg.get('mirror_db', {}).get('name', '?')}")
     print("[health] Calling health endpoint …")
     data = api_get(cfg, "/health")
     print(f"[health] Status            : {data.get('status')}")
@@ -766,7 +753,10 @@ def import_only(cfg: dict, job_dir_path: str) -> None:
 # Media Sync — local index table setup
 # ---------------------------------------------------------------------------
 
-MEDIA_SYNC_STATE_PATH = pathlib.Path(__file__).parent / "media_sync_state.json"
+def _media_sync_state_path(cfg: dict) -> pathlib.Path:
+    p = cfg.get("_media_sync_state_path")
+    return pathlib.Path(p) if p else pathlib.Path(__file__).parent / "media_sync_state.json"
+
 
 MEDIA_LOCAL_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS bdsk_local_media_index (
@@ -1114,17 +1104,18 @@ def _download_one(cfg: dict, item: dict, media_base: pathlib.Path,
 # Media Sync — load / save sync state
 # ---------------------------------------------------------------------------
 
-def _load_sync_state() -> dict:
-    if MEDIA_SYNC_STATE_PATH.exists():
+def _load_sync_state(cfg: dict) -> dict:
+    p = _media_sync_state_path(cfg)
+    if p.exists():
         try:
-            return json.loads(MEDIA_SYNC_STATE_PATH.read_text())
+            return json.loads(p.read_text())
         except Exception:
             pass
     return {"last_sync_at": None}
 
 
-def _save_sync_state(state: dict) -> None:
-    MEDIA_SYNC_STATE_PATH.write_text(json.dumps(state, indent=2))
+def _save_sync_state(cfg: dict, state: dict) -> None:
+    _media_sync_state_path(cfg).write_text(json.dumps(state, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -1167,7 +1158,7 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
     # Ensure local index table exists
     setup_media_local_table(cfg)
 
-    state = _load_sync_state()
+    state = _load_sync_state(cfg)
     sync_start = int(time.time())
 
     if full or not state.get("last_sync_at"):
@@ -1289,7 +1280,7 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
     print(f"[media] {len(download_queue)} files to download (concurrency={concurrency}).")
 
     if not download_queue:
-        _save_sync_state({"last_sync_at": sync_start})
+        _save_sync_state(cfg, {"last_sync_at": sync_start})
         print("[media] Media sync complete (nothing to download).")
         return
 
@@ -1344,7 +1335,7 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
                         )
 
     print(f"[media] Downloads complete: {done} OK, {unchanged} unchanged(304), {errors} failed.")
-    _save_sync_state({"last_sync_at": sync_start})
+    _save_sync_state(cfg, {"last_sync_at": sync_start})
     print("[media] Media sync state saved.")
 
 
@@ -1352,7 +1343,10 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
 # Event Sync — consumer pipeline
 # ---------------------------------------------------------------------------
 
-EVENT_SYNC_STATE_PATH = pathlib.Path(__file__).parent / "event_sync_state.json"
+def _event_sync_state_path(cfg: dict) -> pathlib.Path:
+    p = cfg.get("_event_sync_state_path")
+    return pathlib.Path(p) if p else pathlib.Path(__file__).parent / "event_sync_state.json"
+
 
 EVENT_LOG_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS bdsk_event_log (
@@ -1377,17 +1371,18 @@ def setup_event_log_table(cfg: dict) -> None:
             cur.execute(EVENT_LOG_TABLE_SQL)
 
 
-def _load_event_state() -> dict:
-    if EVENT_SYNC_STATE_PATH.exists():
+def _load_event_state(cfg: dict) -> dict:
+    p = _event_sync_state_path(cfg)
+    if p.exists():
         try:
-            return json.loads(EVENT_SYNC_STATE_PATH.read_text())
+            return json.loads(p.read_text())
         except Exception:
             pass
     return {}
 
 
-def _save_event_state(state: dict) -> None:
-    EVENT_SYNC_STATE_PATH.write_text(json.dumps(state))
+def _save_event_state(cfg: dict, state: dict) -> None:
+    _event_sync_state_path(cfg).write_text(json.dumps(state))
 
 
 def _staging_db_exists(cfg: dict) -> bool:
@@ -1737,7 +1732,9 @@ def _apply_product_upsert(cfg, cur, snapshot: dict) -> None:
 # Webhook Dispatcher
 # ---------------------------------------------------------------------------
 
-HUB_DB_PATH = pathlib.Path(__file__).parent / "hub.db"
+def _hub_db_path(cfg: dict) -> pathlib.Path:
+    p = cfg.get("_hub_db_path")
+    return pathlib.Path(p) if p else pathlib.Path(__file__).parent / "hub.db"
 
 
 def _build_product_payload(snap: dict) -> dict:
@@ -1878,10 +1875,11 @@ def _build_order_payload(snap: dict) -> dict:
     }
 
 
-def _get_active_endpoints(event_name: str) -> list[dict]:
-    if not HUB_DB_PATH.exists():
+def _get_active_endpoints(cfg: dict, event_name: str) -> list[dict]:
+    db_path = _hub_db_path(cfg)
+    if not db_path.exists():
         return []
-    conn = sqlite3.connect(HUB_DB_PATH)
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         cur = conn.cursor()
@@ -1914,12 +1912,13 @@ def _sign_webhook_body(body: bytes, secret: str) -> str:
 
 
 def _log_delivery(
-    endpoint_id: int, event: str, entity_id: int, sent_at: str,
+    cfg: dict, endpoint_id: int, event: str, entity_id: int, sent_at: str,
     http_status: int | None, success: bool, error: str | None,
 ) -> None:
-    if not HUB_DB_PATH.exists():
+    db_path = _hub_db_path(cfg)
+    if not db_path.exists():
         return
-    conn = sqlite3.connect(HUB_DB_PATH)
+    conn = sqlite3.connect(db_path)
     try:
         conn.execute(
             "INSERT INTO webhook_deliveries "
@@ -1938,7 +1937,7 @@ def _dispatch_webhooks(
     event_type: str, snap: dict | None,
 ) -> None:
     event_name = f"{entity_type}.{event_type}"
-    endpoints  = _get_active_endpoints(event_name)
+    endpoints  = _get_active_endpoints(cfg, event_name)
     if not endpoints:
         return
 
@@ -1984,7 +1983,7 @@ def _dispatch_webhooks(
 
         status_str = "ok" if success else "fail"
         print(f"[webhook] {ep['name']} {event_name} entity={entity_id} → {http_status or 'ERR'} ({status_str})")
-        _log_delivery(ep["id"], event_name, entity_id, sent_at, http_status, success, error)
+        _log_delivery(cfg, ep["id"], event_name, entity_id, sent_at, http_status, success, error)
 
 
 def run_event_sync(cfg: dict) -> None:
@@ -2000,7 +1999,7 @@ def run_event_sync(cfg: dict) -> None:
         print("[events] Staging DB swap in progress — skipping this cycle.")
         return
 
-    state    = _load_event_state()
+    state    = _load_event_state(cfg)
     after_id = int(state.get("after_id", 0))
     batch    = int(cfg.get("event_sync", {}).get("batch_size", 200))
     max_retry = int(cfg.get("event_sync", {}).get("max_retries", 10))
@@ -2028,7 +2027,7 @@ def run_event_sync(cfg: dict) -> None:
                     f"to recover pending events. Reprocessing is idempotent (UPSERT)."
                 )
                 after_id = new_cursor
-                _save_event_state({"after_id": after_id})
+                _save_event_state(cfg, {"after_id": after_id})
                 data   = api_get(cfg, "/events/pending", {"after_id": after_id, "limit": batch})
                 events = data.get("items", [])
 
@@ -2154,7 +2153,7 @@ def run_event_sync(cfg: dict) -> None:
 
     # Advance cursor to max id seen in this batch
     max_id = max(int(ev["id"]) for ev in events)
-    _save_event_state({"after_id": max_id})
+    _save_event_state(cfg, {"after_id": max_id})
     print(f"[events] Cursor advanced to after_id={max_id}.")
     print("[events] Event sync complete.")
 
@@ -2201,13 +2200,13 @@ def get_status_data(cfg: dict) -> dict:
         pass
 
     # Local state files
-    media_state     = _load_sync_state()
-    event_state     = _load_event_state()
+    media_state     = _load_sync_state(cfg)
+    event_state     = _load_event_state(cfg)
     event_state_mtime = None
-    if EVENT_SYNC_STATE_PATH.exists():
-        import os
+    _esp = _event_sync_state_path(cfg)
+    if _esp.exists():
         event_state_mtime = datetime.fromtimestamp(
-            os.path.getmtime(EVENT_SYNC_STATE_PATH), tz=timezone.utc
+            _esp.stat().st_mtime, tz=timezone.utc
         ).strftime("%Y-%m-%d %H:%M UTC")
 
     # Count local archive directories
@@ -2312,9 +2311,14 @@ if __name__ == "__main__":
     parser.add_argument("--media-sync-full", action="store_true", help="Run full media file sync (ignores last_sync_at)")
     parser.add_argument("--event-sync",      action="store_true", help="Run event sync (apply pending order/product changes to mirror)")
     parser.add_argument("--status",          action="store_true", help="Show system status overview (read-only)")
+    parser.add_argument("--show-config",     action="store_true", help="Print sanitized config and exit (no secrets)")
     args = parser.parse_args()
 
     cfg = load_config()
+
+    if args.show_config:
+        print_config_summary(cfg)
+        sys.exit(0)
 
     try:
         if args.prune:
