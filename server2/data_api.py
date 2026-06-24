@@ -537,6 +537,30 @@ def get_product_variations(pid):
     return _ok(variations)
 
 
+def _media_mapping_for_product(cur, pid: int) -> dict:
+    """Return { attachment_id: {role, variation_id, sync_status, local_path, checksum} }
+    from the Server 2 media mapping table. Empty if the table doesn't exist yet."""
+    try:
+        cur.execute(
+            "SELECT attachment_id, role, variation_id, download_status, local_path, checksum "
+            "FROM bdsk_local_media_index "
+            "WHERE product_id = %s AND manifest_status = 'active'",
+            (pid,),
+        )
+    except Exception:
+        return {}
+    out: dict = {}
+    for r in cur.fetchall():
+        out[int(r["attachment_id"])] = {
+            "role":         r["role"] or None,
+            "variation_id": int(r["variation_id"]) if r["variation_id"] else None,
+            "sync_status":  r["download_status"],
+            "local_path":   r["local_path"],
+            "checksum":     r["checksum"],
+        }
+    return out
+
+
 @data_api.get("/products/<int:pid>/images")
 @require_api_key
 def get_product_images(pid):
@@ -547,6 +571,17 @@ def get_product_images(pid):
                 return _err("not_found", f"Product {pid} not found.", 404)
             meta = _meta_dict(cur, pid)
             images = _product_images(cur, pid, meta)
+            mapping = _media_mapping_for_product(cur, pid)
+            for img in images:
+                m = mapping.get(int(img["id"])) if img.get("id") else None
+                img["role"]         = m["role"] if m else None
+                img["variation_id"] = m["variation_id"] if m else None
+                img["sync_status"]  = m["sync_status"] if m else "not_synced"
+                # Prefer the mapping's verified local_path/checksum when present
+                if m and m["local_path"]:
+                    img["local_path"] = m["local_path"]
+                if m and m["checksum"]:
+                    img["checksum"] = m["checksum"]
     return _ok(images)
 
 

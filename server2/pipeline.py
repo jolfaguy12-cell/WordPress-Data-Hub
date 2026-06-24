@@ -757,19 +757,33 @@ CREATE TABLE IF NOT EXISTS bdsk_local_media_index (
     mime_type        VARCHAR(100)    DEFAULT NULL,
     file_size        BIGINT          DEFAULT NULL,
     modified_at      VARCHAR(30)     DEFAULT NULL,
+    variation_id     BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    role             VARCHAR(20)     NOT NULL DEFAULT '',
     manifest_status  VARCHAR(10)     NOT NULL DEFAULT 'active',
     local_path       TEXT            DEFAULT NULL,
     local_file_size  BIGINT          DEFAULT NULL,
+    etag             VARCHAR(255)    DEFAULT NULL,
+    checksum         CHAR(64)        DEFAULT NULL,
     download_status  VARCHAR(10)     NOT NULL DEFAULT 'pending',
     downloaded_at    DATETIME        DEFAULT NULL,
     last_checked_at  DATETIME        DEFAULT NULL,
     retry_count      INT             NOT NULL DEFAULT 0,
+    last_error       TEXT            DEFAULT NULL,
     PRIMARY KEY      (id),
     UNIQUE KEY       manifest_id (manifest_id),
     KEY              download_status (download_status),
     KEY              attachment_id (attachment_id)
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
 """
+
+# Additive migrations for pre-existing bdsk_local_media_index tables.
+MEDIA_LOCAL_TABLE_MIGRATIONS = [
+    "ADD COLUMN variation_id BIGINT UNSIGNED NOT NULL DEFAULT 0",
+    "ADD COLUMN role         VARCHAR(20)     NOT NULL DEFAULT ''",
+    "ADD COLUMN etag         VARCHAR(255)    DEFAULT NULL",
+    "ADD COLUMN checksum     CHAR(64)        DEFAULT NULL",
+    "ADD COLUMN last_error   TEXT            DEFAULT NULL",
+]
 
 
 def _media_conn(cfg: dict):
@@ -790,6 +804,14 @@ def setup_media_local_table(cfg: dict) -> None:
     with _media_conn(cfg) as conn:
         with conn.cursor() as cur:
             cur.execute(MEDIA_LOCAL_TABLE_SQL)
+            # Find existing columns and apply only the missing additive migrations
+            # (ADD COLUMN IF NOT EXISTS is unsupported on MySQL 8 — check first).
+            cur.execute("SHOW COLUMNS FROM bdsk_local_media_index")
+            have = {r[0] for r in cur.fetchall()}
+            for clause in MEDIA_LOCAL_TABLE_MIGRATIONS:
+                col = clause.split()[2]  # "ADD COLUMN <name> ..."
+                if col not in have:
+                    cur.execute(f"ALTER TABLE bdsk_local_media_index {clause}")
 
 
 # ---------------------------------------------------------------------------
@@ -806,21 +828,56 @@ def _fetch_manifest_page(cfg: dict, after_id: int, limit: int,
     return api_get(cfg, "/media-manifest", params=params)
 
 
+# Maps the WP media-index image_type to the Server-2 mapping "role".
+_ROLE_BY_IMAGE_TYPE = {
+    "main":      "main",
+    "gallery":   "gallery",
+    "variation": "variation",
+    "evidence":  "content",
+    "unknown":   "other",
+}
+
+
+def _resolve_variation_parent(cur, variation_id: int) -> int:
+    """Return the parent product id for a variation post (0 if not resolvable)."""
+    cur.execute(
+        f"SELECT post_parent FROM {_WP_PREFIX}posts WHERE ID = %s AND post_type = 'product_variation'",
+        (variation_id,),
+    )
+    row = cur.fetchone()
+    return int(row[0]) if row and row[0] else 0
+
+
 def _upsert_local_media(cur, item: dict) -> None:
+    image_type = item["image_type"]
+    role       = _ROLE_BY_IMAGE_TYPE.get(image_type, "other")
+
+    # The WP index stores product_id = variation post id for variation images.
+    # Record the variation id separately and resolve the owning product so the
+    # Hub can present products/{product_id}/variations/{variation_id}/.
+    raw_pid      = item.get("product_id") or 0
+    product_id   = raw_pid
+    variation_id = 0
+    if image_type == "variation" and raw_pid:
+        variation_id = raw_pid
+        product_id   = _resolve_variation_parent(cur, raw_pid)
+
     cur.execute(
         """
         INSERT INTO bdsk_local_media_index
-          (manifest_id, attachment_id, product_id, order_id, image_type,
+          (manifest_id, attachment_id, product_id, order_id, variation_id, role, image_type,
            original_url, alt_text, title, caption, width, height, mime_type,
            file_size, modified_at, manifest_status, last_checked_at)
         VALUES
-          (%s, %s, %s, %s, %s,
+          (%s, %s, %s, %s, %s, %s, %s,
            %s, %s, %s, %s, %s, %s, %s,
            %s, %s, %s, NOW())
         ON DUPLICATE KEY UPDATE
           attachment_id   = VALUES(attachment_id),
           product_id      = VALUES(product_id),
           order_id        = VALUES(order_id),
+          variation_id    = VALUES(variation_id),
+          role            = VALUES(role),
           image_type      = VALUES(image_type),
           original_url    = VALUES(original_url),
           alt_text        = VALUES(alt_text),
@@ -837,9 +894,11 @@ def _upsert_local_media(cur, item: dict) -> None:
         (
             item["id"],
             item["attachment_id"],
-            item.get("product_id") or 0,
+            product_id,
             item.get("order_id") or 0,
-            item["image_type"],
+            variation_id,
+            role,
+            image_type,
             item["original_url"],
             item.get("alt_text"),
             item.get("title"),
@@ -873,33 +932,54 @@ def _local_path_for(media_base: pathlib.Path, item: dict) -> pathlib.Path:
 
 
 def _download_one(cfg: dict, item: dict, media_base: pathlib.Path,
-                  max_file_size: int) -> tuple[str, str | None]:
-    """Returns (manifest_id_str, error_message_or_None)."""
-    manifest_id = str(item["id"])
-    url         = item["original_url"]
-    dest        = _local_path_for(media_base, item)
+                  max_file_size: int, timeout: tuple[int, int],
+                  retries: int) -> dict:
+    """Download one media file with conditional GET + retry/backoff.
+
+    Returns a result dict:
+      { manifest_id, error, not_modified, etag, checksum, skipped }
+    On a 304 (unchanged vs. stored etag/modified_at) the existing file is kept.
+    """
+    manifest_id   = str(item["id"])
+    url           = item["original_url"]
+    dest          = _local_path_for(media_base, item)
     expected_size = item.get("file_size")
+
+    def _result(**kw):
+        base = {"manifest_id": manifest_id, "error": None, "not_modified": False,
+                "etag": None, "checksum": None, "skipped": False}
+        base.update(kw)
+        return base
 
     # Skip files above max_file_size
     if expected_size and expected_size > max_file_size:
-        return manifest_id, f"skipped: file_size {expected_size} > max {max_file_size}"
+        return _result(skipped=True,
+                       error=f"skipped: file_size {expected_size} > max {max_file_size}")
+
+    # Conditional GET via the stored ETag (the reliable validator). We do NOT send
+    # If-Modified-Since: the stored modified_at is WordPress's DB modified time, not
+    # the file's HTTP Last-Modified, so it can't be compared safely. Whether a file
+    # is stale is already decided in the queue-building step (size + modified_at).
+    cond_headers = {"Authorization": f"Bearer {cfg['api_secret']}"}
+    if item.get("etag") and dest.exists():
+        cond_headers["If-None-Match"] = item["etag"]
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
 
-    for attempt in range(3):
+    for attempt in range(retries):
         try:
-            with requests.get(
-                url,
-                headers={"Authorization": f"Bearer {cfg['api_secret']}"},
-                stream=True,
-                timeout=(10, 120),  # connect, read
-            ) as r:
+            with requests.get(url, headers=cond_headers, stream=True, timeout=timeout) as r:
+                if r.status_code == 304:
+                    return _result(not_modified=True, etag=item.get("etag"))
                 if not r.ok:
                     raise RuntimeError(f"HTTP {r.status_code}")
+                sha = hashlib.sha256()
                 with part.open("wb") as f:
                     for chunk in r.iter_content(chunk_size=65536):
                         f.write(chunk)
+                        sha.update(chunk)
+                etag = r.headers.get("ETag")
 
             actual = part.stat().st_size
             if expected_size and actual != expected_size:
@@ -907,15 +987,15 @@ def _download_one(cfg: dict, item: dict, media_base: pathlib.Path,
                 raise RuntimeError(f"size mismatch: got {actual}, expected {expected_size}")
 
             part.rename(dest)
-            return manifest_id, None
+            return _result(etag=etag, checksum=sha.hexdigest())
 
         except Exception as exc:
-            if attempt == 2:
+            if attempt == retries - 1:
                 part.unlink(missing_ok=True)
-                return manifest_id, str(exc)
+                return _result(error=str(exc))
             time.sleep(2 ** attempt)
 
-    return manifest_id, "max retries exceeded"
+    return _result(error="max retries exceeded")
 
 
 # ---------------------------------------------------------------------------
@@ -946,8 +1026,17 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
         return
 
     media_base    = pathlib.Path(media_cfg.get("storage_path", "/root/wordpress-data-hub/data/media"))
-    concurrency   = int(media_cfg.get("concurrency", 4))
+    # Throttling: concurrency default 1, hard-capped at 2.
+    concurrency   = max(1, min(2, int(media_cfg.get("concurrency", 1))))
     max_file_size = int(media_cfg.get("max_file_size_bytes", 52_428_800))  # 50 MB
+    # Per-run caps so a run is bounded and near-live (not a full uploads sync).
+    max_files_per_run = int(media_cfg.get("max_files_per_run", 500))
+    max_mb_per_run    = int(media_cfg.get("max_mb_per_run", 300))
+    # Retry / timeout
+    dl_retries    = int(media_cfg.get("download_retries", 3))
+    dl_giveup     = int(media_cfg.get("max_download_retries", 5))  # stop re-queuing after this
+    timeout       = (int(media_cfg.get("connect_timeout", 10)),
+                     int(media_cfg.get("read_timeout", 120)))
     page_limit    = 200
 
     media_base.mkdir(parents=True, exist_ok=True)
@@ -1023,41 +1112,62 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
             )
 
     # ---- Phase 3: determine download queue ----
+    # Bound retries: rows that have failed >= dl_giveup times are not re-queued
+    # (they stay 'failed' with last_error) so failed work cannot grow unbounded.
     with _media_conn(cfg) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT manifest_id, attachment_id, image_type, original_url,
                        file_size, modified_at, local_path, local_file_size,
-                       downloaded_at
+                       downloaded_at, etag
                 FROM bdsk_local_media_index
                 WHERE manifest_status = 'active'
                 AND download_status NOT IN ('deleted', 'skipped')
-                """
+                AND retry_count < %s
+                """,
+                (dl_giveup,),
             )
             rows = cur.fetchall()
 
     download_queue = []
-    for (mid, att_id, itype, url, file_size, mod_at, local_path, local_file_size, downloaded_at) in rows:
+    for (mid, att_id, itype, url, file_size, mod_at, local_path,
+         local_file_size, downloaded_at, etag) in rows:
+        def _q():
+            return {"id": mid, "attachment_id": att_id, "image_type": itype,
+                    "original_url": url, "file_size": file_size,
+                    "modified_at": mod_at, "etag": etag}
         if not local_path:
-            # Never downloaded
-            download_queue.append({"id": mid, "attachment_id": att_id, "image_type": itype,
-                                   "original_url": url, "file_size": file_size, "modified_at": mod_at})
-            continue
+            download_queue.append(_q()); continue
         dest = pathlib.Path(local_path)
         if not dest.exists():
-            download_queue.append({"id": mid, "attachment_id": att_id, "image_type": itype,
-                                   "original_url": url, "file_size": file_size, "modified_at": mod_at})
-            continue
+            download_queue.append(_q()); continue
         if file_size and local_file_size != file_size:
-            download_queue.append({"id": mid, "attachment_id": att_id, "image_type": itype,
-                                   "original_url": url, "file_size": file_size, "modified_at": mod_at})
-            continue
-        if mod_at and downloaded_at and mod_at > downloaded_at.isoformat() if hasattr(downloaded_at, 'isoformat') else False:
-            download_queue.append({"id": mid, "attachment_id": att_id, "image_type": itype,
-                                   "original_url": url, "file_size": file_size, "modified_at": mod_at})
+            download_queue.append(_q()); continue
+        if mod_at and downloaded_at and (mod_at > downloaded_at.isoformat()
+                                         if hasattr(downloaded_at, 'isoformat') else False):
+            download_queue.append(_q()); continue
 
-    print(f"[media] {len(download_queue)} files to download.")
+    total_candidates = len(download_queue)
+
+    # Apply per-run caps (files + MB). Remaining items resume on the next run.
+    capped = []
+    acc_mb = 0.0
+    for item in download_queue:
+        if len(capped) >= max_files_per_run:
+            break
+        fs_mb = (item.get("file_size") or 0) / 1_048_576
+        if capped and (acc_mb + fs_mb) > max_mb_per_run:
+            break
+        capped.append(item)
+        acc_mb += fs_mb
+    if len(capped) < total_candidates:
+        print(f"[media] cap reached: queuing {len(capped)}/{total_candidates} "
+              f"(max_files={max_files_per_run}, max_mb={max_mb_per_run}); "
+              f"remainder resumes next run.")
+    download_queue = capped
+
+    print(f"[media] {len(download_queue)} files to download (concurrency={concurrency}).")
 
     if not download_queue:
         _save_sync_state({"last_sync_at": sync_start})
@@ -1065,51 +1175,56 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
         return
 
     # ---- Phase 4: concurrent downloads ----
-    done = 0
-    errors = 0
+    done = unchanged = errors = 0
 
     def _do_download(item):
-        return _download_one(cfg, item, media_base, max_file_size)
+        return _download_one(cfg, item, media_base, max_file_size, timeout, dl_retries)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {pool.submit(_do_download, item): item for item in download_queue}
         for future in concurrent.futures.as_completed(futures):
             item = futures[future]
-            manifest_id, error = future.result()
+            res  = future.result()
             dest = _local_path_for(media_base, item)
 
             with _media_conn(cfg) as conn:
                 with conn.cursor() as cur:
-                    if error:
+                    if res["skipped"]:
+                        cur.execute(
+                            "UPDATE bdsk_local_media_index SET download_status='skipped', "
+                            "last_error=%s, last_checked_at=NOW() WHERE manifest_id=%s",
+                            (res["error"], res["manifest_id"]),
+                        )
+                        print(f"[media] SKIP  attachment={item['attachment_id']} — {res['error']}")
+                    elif res["not_modified"]:
+                        unchanged += 1
+                        cur.execute(
+                            "UPDATE bdsk_local_media_index SET download_status='downloaded', "
+                            "last_checked_at=NOW(), retry_count=0, last_error=NULL "
+                            "WHERE manifest_id=%s",
+                            (res["manifest_id"],),
+                        )
+                    elif res["error"]:
                         errors += 1
                         cur.execute(
-                            """
-                            UPDATE bdsk_local_media_index
-                            SET download_status = 'failed', retry_count = retry_count + 1,
-                                last_checked_at = NOW()
-                            WHERE manifest_id = %s
-                            """,
-                            (manifest_id,),
+                            "UPDATE bdsk_local_media_index SET download_status='failed', "
+                            "retry_count=retry_count+1, last_error=%s, last_checked_at=NOW() "
+                            "WHERE manifest_id=%s",
+                            (res["error"][:500], res["manifest_id"]),
                         )
-                        print(f"[media] FAIL  attachment={item['attachment_id']} — {error}")
+                        print(f"[media] FAIL  attachment={item['attachment_id']} — {res['error']}")
                     else:
                         done += 1
                         file_size = dest.stat().st_size if dest.exists() else None
                         cur.execute(
-                            """
-                            UPDATE bdsk_local_media_index
-                            SET download_status = 'downloaded',
-                                local_path = %s,
-                                local_file_size = %s,
-                                downloaded_at = NOW(),
-                                last_checked_at = NOW(),
-                                retry_count = 0
-                            WHERE manifest_id = %s
-                            """,
-                            (str(dest), file_size, manifest_id),
+                            "UPDATE bdsk_local_media_index SET download_status='downloaded', "
+                            "local_path=%s, local_file_size=%s, etag=%s, checksum=%s, "
+                            "downloaded_at=NOW(), last_checked_at=NOW(), retry_count=0, "
+                            "last_error=NULL WHERE manifest_id=%s",
+                            (str(dest), file_size, res["etag"], res["checksum"], res["manifest_id"]),
                         )
 
-    print(f"[media] Downloads complete: {done} OK, {errors} failed.")
+    print(f"[media] Downloads complete: {done} OK, {unchanged} unchanged(304), {errors} failed.")
     _save_sync_state({"last_sync_at": sync_start})
     print("[media] Media sync state saved.")
 
