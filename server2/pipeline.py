@@ -1020,17 +1020,28 @@ def _upsert_local_media(hub_cur, item: dict, mirror_cur=None) -> None:
 # ---------------------------------------------------------------------------
 
 def _local_path_for(media_base: pathlib.Path, item: dict) -> pathlib.Path:
-    url = item["original_url"]
+    url          = item["original_url"]
+    basename     = url.split("/")[-1].split("?")[0] or "unknown"
+    role         = item.get("role", "")
+    product_id   = item.get("product_id") or 0
+    variation_id = item.get("variation_id") or 0
+
+    if role == "main" and product_id:
+        return media_base / "products" / str(product_id) / "main" / basename
+    if role == "gallery" and product_id:
+        return media_base / "products" / str(product_id) / "gallery" / basename
+    if role == "variation" and product_id:
+        var_sub = f"variations/{variation_id}" if variation_id else "variations"
+        return media_base / "products" / str(product_id) / var_sub / basename
+
+    # Non-product media (evidence/content, other) — mirror WP uploads layout
     marker = "/wp-content/uploads/"
     idx = url.find(marker)
     if idx != -1:
-        rel = url[idx + len(marker):]
-        # Sanitise: strip query string / fragment
-        rel = rel.split("?")[0].split("#")[0]
-        return media_base / rel
-    # Fallback: flat directory named by attachment_id
-    basename = url.split("/")[-1].split("?")[0] or "unknown"
-    return media_base / "_unmatched" / f"{item['attachment_id']}_{basename}"
+        rel = url[idx + len(marker):].split("?")[0].split("#")[0]
+        return media_base / "attachments" / rel
+
+    return media_base / "attachments" / "_unmatched" / f"{item['attachment_id']}_{basename}"
 
 
 def _download_one(cfg: dict, item: dict, media_base: pathlib.Path,
@@ -1230,7 +1241,7 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
                 """
                 SELECT manifest_id, attachment_id, image_type, original_url,
                        file_size, modified_at, local_path, local_file_size,
-                       downloaded_at, etag
+                       downloaded_at, etag, product_id, variation_id, role
                 FROM bdsk_local_media_index
                 WHERE manifest_status = 'active'
                 AND download_status NOT IN ('deleted', 'skipped')
@@ -1242,11 +1253,12 @@ def run_media_sync(cfg: dict, full: bool = False) -> None:
 
     download_queue = []
     for (mid, att_id, itype, url, file_size, mod_at, local_path,
-         local_file_size, downloaded_at, etag) in rows:
+         local_file_size, downloaded_at, etag, product_id, variation_id, role) in rows:
         def _q():
             return {"id": mid, "attachment_id": att_id, "image_type": itype,
                     "original_url": url, "file_size": file_size,
-                    "modified_at": mod_at, "etag": etag}
+                    "modified_at": mod_at, "etag": etag,
+                    "product_id": product_id, "variation_id": variation_id, "role": role}
         if not local_path:
             download_queue.append(_q()); continue
         dest = pathlib.Path(local_path)
