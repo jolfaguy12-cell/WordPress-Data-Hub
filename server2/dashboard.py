@@ -277,7 +277,7 @@ def get_orders_page_data(filters: dict) -> dict:
                     orders.append({
                         "id": oid,
                         "status": st[3:] if st.startswith("wc-") else st,
-                        "currency": r["currency"] or "IRR",
+                        "currency": r["currency"] or "IRT",
                         "total": float(r["total_amount"] or 0),
                         "date_created": str(r["date_created_gmt"] or "")[:16],
                         "order_source": src,
@@ -332,7 +332,7 @@ def get_orders_page_data(filters: dict) -> dict:
                     unpaid.append({
                         "id": oid,
                         "status": st[3:] if st.startswith("wc-") else st,
-                        "currency": r["currency"] or "IRR",
+                        "currency": r["currency"] or "IRT",
                         "total": float(r["total_amount"] or 0),
                         "date_created": str(r["date_created_gmt"] or "")[:16],
                         "order_source": src2,
@@ -358,6 +358,195 @@ def get_orders_page_data(filters: dict) -> dict:
             "by_status": by_status,
             "orders": orders, "filtered_total": filtered_total,
             "unpaid": unpaid,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+_STOCK_STATUS_FA = {
+    "instock": "موجود", "outofstock": "ناموجود", "onbackorder": "پیش‌سفارش",
+}
+_PRODUCT_STATUS_FA = {
+    "publish": "منتشرشده", "draft": "پیش‌نویس", "private": "خصوصی", "trash": "حذف‌شده",
+}
+
+def get_products_page_data(filters: dict) -> dict:
+    """Fetch products page data from the mirror DB."""
+    search_f      = filters.get("search", "").strip()
+    status_f      = filters.get("status", "")
+    stock_f       = filters.get("stock_status", "")
+    has_price_f   = filters.get("has_price", "")
+    has_image_f   = filters.get("has_image", "")
+    cat_f         = filters.get("category_id", "")
+    brand_f       = filters.get("brand_id", "")
+    page          = max(1, int(filters.get("page", 1) or 1))
+    per_page      = 30
+
+    try:
+        with _mirror_db() as conn:
+            with conn.cursor() as cur:
+                # ── Summary stats ─────────────────────────────────────────
+                cur.execute(
+                    "SELECT COUNT(*) as tot,"
+                    " SUM(p.post_status='publish') as published,"
+                    " SUM(p.post_status='draft') as draft,"
+                    " SUM(p.post_status='private') as priv,"
+                    " SUM(l.stock_status='outofstock' OR l.stock_status='') as outofstock_cnt,"
+                    " SUM(l.stock_status='onbackorder') as backorder_cnt,"
+                    " SUM(l.min_price IS NULL OR l.min_price=0) as no_price_cnt,"
+                    " SUM(pm.meta_value IS NULL OR pm.meta_value='') as no_image_cnt"
+                    " FROM wp_posts p"
+                    " LEFT JOIN wp_wc_product_meta_lookup l ON l.product_id=p.ID"
+                    " LEFT JOIN wp_postmeta pm ON pm.post_id=p.ID AND pm.meta_key='_thumbnail_id'"
+                    " WHERE p.post_type='product'",
+                )
+                s = cur.fetchone()
+                total         = int(s["tot"] or 0)
+                published_cnt = int(s["published"] or 0)
+                draft_cnt     = int(s["draft"] or 0)
+                private_cnt   = int(s["priv"] or 0)
+                outofstock_cnt= int(s["outofstock_cnt"] or 0)
+                backorder_cnt = int(s["backorder_cnt"] or 0)
+                no_price_cnt  = int(s["no_price_cnt"] or 0)
+                no_image_cnt  = int(s["no_image_cnt"] or 0)
+
+                # ── Categories & brands for dropdowns ────────────────────
+                cur.execute(
+                    "SELECT t.term_id, t.name FROM wp_terms t"
+                    " JOIN wp_term_taxonomy tt ON tt.term_id=t.term_id"
+                    " WHERE tt.taxonomy='product_cat' AND tt.count>0"
+                    " ORDER BY tt.count DESC LIMIT 40"
+                )
+                categories = [{"id": r["term_id"], "name": r["name"]} for r in cur.fetchall()]
+                cur.execute(
+                    "SELECT t.term_id, t.name FROM wp_terms t"
+                    " JOIN wp_term_taxonomy tt ON tt.term_id=t.term_id"
+                    " WHERE tt.taxonomy='product_brand' AND tt.count>0"
+                    " ORDER BY tt.count DESC LIMIT 30"
+                )
+                brands = [{"id": r["term_id"], "name": r["name"]} for r in cur.fetchall()]
+
+                # ── Filtered product list ─────────────────────────────────
+                where: list[str] = ["p.post_type = 'product'"]
+                params: list     = []
+
+                if status_f:
+                    where.append("p.post_status = %s"); params.append(status_f)
+                if stock_f:
+                    where.append("l.stock_status = %s"); params.append(stock_f)
+                if has_price_f == "1":
+                    where.append("l.min_price IS NOT NULL AND l.min_price > 0")
+                elif has_price_f == "0":
+                    where.append("(l.min_price IS NULL OR l.min_price = 0)")
+                if has_image_f == "1":
+                    where.append("pm_th.meta_value IS NOT NULL AND pm_th.meta_value != ''")
+                elif has_image_f == "0":
+                    where.append("(pm_th.meta_value IS NULL OR pm_th.meta_value = '')")
+                if cat_f:
+                    where.append(
+                        "EXISTS (SELECT 1 FROM wp_term_relationships tr2"
+                        " JOIN wp_term_taxonomy tt2 ON tt2.term_taxonomy_id=tr2.term_taxonomy_id"
+                        " WHERE tr2.object_id=p.ID AND tt2.taxonomy='product_cat' AND tt2.term_id=%s)"
+                    ); params.append(int(cat_f))
+                if brand_f:
+                    where.append(
+                        "EXISTS (SELECT 1 FROM wp_term_relationships tr3"
+                        " JOIN wp_term_taxonomy tt3 ON tt3.term_taxonomy_id=tr3.term_taxonomy_id"
+                        " WHERE tr3.object_id=p.ID AND tt3.taxonomy='product_brand' AND tt3.term_id=%s)"
+                    ); params.append(int(brand_f))
+                if search_f:
+                    where.append("(p.post_title LIKE %s OR l.sku LIKE %s)")
+                    params += [f"%{search_f}%", f"%{search_f}%"]
+
+                where_sql = " AND ".join(where)
+                cur.execute(f"SELECT COUNT(*) as cnt FROM wp_posts p"
+                            f" LEFT JOIN wp_wc_product_meta_lookup l ON l.product_id=p.ID"
+                            f" LEFT JOIN wp_postmeta pm_th ON pm_th.post_id=p.ID AND pm_th.meta_key='_thumbnail_id'"
+                            f" WHERE {where_sql}", params)
+                filtered_total = int(cur.fetchone()["cnt"] or 0)
+
+                offset = (page - 1) * per_page
+                cur.execute(
+                    f"SELECT p.ID, p.post_title, p.post_status, p.post_modified,"
+                    f" p.guid, l.sku, l.min_price, l.max_price,"
+                    f" l.stock_status, l.stock_quantity, l.total_sales,"
+                    f" pm_th.meta_value as thumbnail_id"
+                    f" FROM wp_posts p"
+                    f" LEFT JOIN wp_wc_product_meta_lookup l ON l.product_id=p.ID"
+                    f" LEFT JOIN wp_postmeta pm_th ON pm_th.post_id=p.ID AND pm_th.meta_key='_thumbnail_id'"
+                    f" WHERE {where_sql}"
+                    f" ORDER BY p.ID DESC LIMIT %s OFFSET %s",
+                    params + [per_page, offset],
+                )
+                product_rows = cur.fetchall()
+                pids = [r["ID"] for r in product_rows]
+
+                # Batch fetch categories + brands for listed products
+                cat_map: dict   = {}
+                brand_map: dict = {}
+                media_map: dict = {}
+                if pids:
+                    ph = ",".join(["%s"] * len(pids))
+                    cur.execute(
+                        f"SELECT tr.object_id, t.name, tt.taxonomy"
+                        f" FROM wp_term_relationships tr"
+                        f" JOIN wp_term_taxonomy tt ON tt.term_taxonomy_id=tr.term_taxonomy_id"
+                        f" JOIN wp_terms t ON t.term_id=tt.term_id"
+                        f" WHERE tr.object_id IN ({ph})"
+                        f" AND tt.taxonomy IN ('product_cat','product_brand')"
+                        f" ORDER BY tr.object_id, tt.taxonomy",
+                        pids,
+                    )
+                    for r in cur.fetchall():
+                        oid = r["object_id"]
+                        if r["taxonomy"] == "product_cat":
+                            cat_map.setdefault(oid, []).append(r["name"])
+                        else:
+                            brand_map.setdefault(oid, []).append(r["name"])
+
+                    # Media status from hub_state
+                    cur.execute(
+                        f"SELECT product_id, image_type, download_status"
+                        f" FROM behdashtik_hub_state_dev.bdsk_local_media_index"
+                        f" WHERE product_id IN ({ph}) AND image_type='main'",
+                        pids,
+                    )
+                    for r in cur.fetchall():
+                        media_map[r["product_id"]] = r["download_status"]
+
+                products = []
+                for r in product_rows:
+                    pid  = r["ID"]
+                    th   = r["thumbnail_id"]
+                    products.append({
+                        "id":            pid,
+                        "title":         r["post_title"] or "—",
+                        "status":        r["post_status"] or "",
+                        "modified":      str(r["post_modified"] or "")[:16],
+                        "sku":           r["sku"] or "",
+                        "min_price":     float(r["min_price"] or 0),
+                        "max_price":     float(r["max_price"] or 0),
+                        "stock_status":  r["stock_status"] or "instock",
+                        "stock_qty":     r["stock_quantity"],
+                        "total_sales":   int(r["total_sales"] or 0),
+                        "has_image":     bool(th),
+                        "image_local":   media_map.get(pid),
+                        "categories":    ", ".join(cat_map.get(pid, [])) or "—",
+                        "brands":        ", ".join(brand_map.get(pid, [])) or "—",
+                        "url":           r["guid"] or "",
+                    })
+
+        return {
+            "ok": True,
+            "total": total, "published_cnt": published_cnt,
+            "draft_cnt": draft_cnt, "private_cnt": private_cnt,
+            "outofstock_cnt": outofstock_cnt, "backorder_cnt": backorder_cnt,
+            "no_price_cnt": no_price_cnt, "no_image_cnt": no_image_cnt,
+            "categories": categories, "brands": brands,
+            "products": products,
+            "filtered_total": filtered_total,
+            "page": page, "per_page": per_page,
+            "total_pages": max(1, (filtered_total + per_page - 1) // per_page),
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
@@ -593,11 +782,28 @@ def _require_login():
 # ---------------------------------------------------------------------------
 
 CSS = """
+@import url('https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css');
+
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+body { font-family: "Vazirmatn", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
        background: #f3f4f6; color: #111827; min-height: 100vh }
 a { color: #2563eb; text-decoration: none }
 a:hover { text-decoration: underline }
+
+/* RTL pages */
+.rtl { direction: rtl; text-align: right }
+.rtl th { text-align: right }
+.rtl .nav { flex-direction: row-reverse }
+.rtl .nav .brand { margin-right: 0; margin-left: 28px }
+.rtl .nav .user-chip { margin-right: 0; margin-left: 8px }
+.rtl .filter-bar form { flex-direction: row-reverse }
+.rtl .src-row { flex-direction: row-reverse }
+.rtl .stat-strip { flex-direction: row-reverse }
+.rtl table { direction: rtl }
+.rtl td, .rtl th { text-align: right }
+.rtl .tbl-wrap { direction: rtl }
+.rtl .actions { flex-direction: row-reverse }
+.rtl .dot { margin-right: 0; margin-left: 5px }
 
 /* Nav */
 .nav { background: #1e293b; color: #e2e8f0; padding: 0 24px;
@@ -757,26 +963,27 @@ tr:last-child td { border-bottom: none }
 
 BASE = """\
 <!DOCTYPE html>
-<html lang="en">
+<html lang="fa" dir="rtl">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 {%- if refresh %}<meta http-equiv="refresh" content="{{ refresh }}">{%- endif %}
-<title>{% block title %}Behdashtik Hub{% endblock %}</title>
+<title>{% block title %}بهداشتیک هاب{% endblock %}</title>
 <style>{{ css }}</style>
 </head>
-<body>
+<body class="rtl">
 {% block nav %}
 <nav class="nav">
-  <span class="brand">&#x1F4CA; Behdashtik Hub</span>
-  <a href="{{ url_for('dashboard') }}" class="{{ 'active' if active == 'dashboard' }}">Dashboard</a>
-  <a href="{{ url_for('orders_page') }}" class="{{ 'active' if active == 'orders' }}">Orders</a>
-  <a href="{{ url_for('users_page') }}" class="{{ 'active' if active == 'users' }}">Users</a>
-  <a href="{{ url_for('webhooks_page') }}" class="{{ 'active' if active == 'webhooks' }}">Webhooks</a>
+  <span class="brand">&#x1F4CA; بهداشتیک هاب</span>
+  <a href="{{ url_for('dashboard') }}" class="{{ 'active' if active == 'dashboard' }}">داشبورد</a>
+  <a href="{{ url_for('orders_page') }}" class="{{ 'active' if active == 'orders' }}">سفارش‌ها</a>
+  <a href="{{ url_for('products_page') }}" class="{{ 'active' if active == 'products' }}">محصولات</a>
+  <a href="{{ url_for('users_page') }}" class="{{ 'active' if active == 'users' }}">کاربران</a>
+  <a href="{{ url_for('webhooks_page') }}" class="{{ 'active' if active == 'webhooks' }}">وب‌هوک‌ها</a>
   <span class="spacer"></span>
   <span class="user-chip">{{ current_user }}</span>
   <form method="post" action="{{ url_for('logout') }}" style="margin:0">
-    <button class="btn btn-secondary" style="padding:5px 12px;font-size:.8rem">Logout</button>
+    <button class="btn btn-secondary" style="padding:5px 12px;font-size:.8rem">خروج</button>
   </form>
 </nav>
 {% endblock %}
@@ -1100,202 +1307,403 @@ WEBHOOKS_PAGE = """\
 </div>
 {% endblock %}"""
 
+_ORDER_SRC_FA = {"basalam": "باسلام", "website": "سایت", "manual": "دستی", "unknown": "نامشخص"}
+_STATUS_FA = {
+    "completed": "تکمیل‌شده", "processing": "در حال پردازش", "pending": "در انتظار پرداخت",
+    "failed": "ناموفق", "on-hold": "در انتظار", "cancelled": "لغوشده",
+    "refunded": "مسترد‌شده", "bslm-wait-vendor": "انتظار فروشنده (باسلام)",
+    "bslm-shipping": "در حال ارسال (باسلام)", "bslm-preparation": "آماده‌سازی (باسلام)",
+}
+
 ORDERS_PAGE = """\
 {% extends 'base.html' %}
-{% block title %}Orders — Behdashtik Hub{% endblock %}
+{% block title %}سفارش‌ها — بهداشتیک هاب{% endblock %}
 {% block body %}
 <div class="page">
-  <h1>Order Reporting</h1>
+  <h1>گزارش سفارش‌ها</h1>
 
   {%- if not ok %}
-  <div class="alert alert-err">Mirror DB error: {{ error }}</div>
+  <div class="alert alert-err">خطا در اتصال به پایگاه داده: {{ error }}</div>
   {%- else %}
 
-  {# ── Summary strip ─────────────────────────────────────────────── #}
+  {# ── خلاصه آماری ────────────────────────────────────────────────── #}
   <div class="stat-strip">
     <div class="stat-box">
       <div class="big">{{ total_orders }}</div>
-      <div class="lbl2">Total Orders</div>
+      <div class="lbl2">کل سفارش‌ها</div>
     </div>
     <div class="stat-box">
       <div class="big">{{ "{:,.0f}".format(total_sales) }}</div>
-      <div class="lbl2">Total Sales (IRR)</div>
+      <div class="lbl2">مجموع فروش (تومان)</div>
     </div>
     <div class="stat-box">
       <div class="big" style="color:{% if unpaid_count > 0 %}#dc2626{% else %}#22c55e{% endif %}">{{ unpaid_count }}</div>
-      <div class="lbl2">Unpaid / Recovery</div>
+      <div class="lbl2">پرداخت‌نشده / قابل پیگیری</div>
     </div>
     <div class="stat-box">
       <div class="big" style="color:#92400e">{{ basalam_cnt }}</div>
-      <div class="lbl2">Basalam Orders</div>
-      <div style="font-size:.72rem;color:#9ca3af">{{ "{:,.0f}".format(basalam_sales) }} IRR</div>
+      <div class="lbl2">سفارش‌های باسلام</div>
+      <div style="font-size:.72rem;color:#9ca3af">{{ "{:,.0f}".format(basalam_sales) }} تومان</div>
     </div>
     <div class="stat-box">
       <div class="big">{{ has_phone_cnt }}/{{ has_email_cnt }}</div>
-      <div class="lbl2">Has Phone / Email</div>
+      <div class="lbl2">شماره تماس / ایمیل</div>
     </div>
   </div>
 
-  {# ── By-source breakdown ───────────────────────────────────────── #}
+  {# ── تفکیک بر اساس منبع ───────────────────────────────────────── #}
   <div class="card" style="margin-bottom:20px">
-    <h2>By Source</h2>
+    <h2>منبع سفارش</h2>
     <div class="src-row">
       <div class="src-card">
         <div class="src-num" style="color:#1e40af">{{ website_cnt }}</div>
-        <div class="src-lbl">Website</div>
+        <div class="src-lbl">سایت</div>
         <div class="src-sub">{{ "{:,.0f}".format(website_sales) }}</div>
       </div>
       <div class="src-card">
         <div class="src-num" style="color:#92400e">{{ basalam_cnt }}</div>
-        <div class="src-lbl">Basalam</div>
+        <div class="src-lbl">باسلام</div>
         <div class="src-sub">{{ "{:,.0f}".format(basalam_sales) }}</div>
       </div>
       <div class="src-card">
         <div class="src-num" style="color:#6b21a8">{{ manual_cnt }}</div>
-        <div class="src-lbl">Manual</div>
+        <div class="src-lbl">دستی</div>
         <div class="src-sub">{{ "{:,.0f}".format(manual_sales) }}</div>
       </div>
       <div class="src-card">
         <div class="src-num" style="color:#475569">{{ unknown_cnt }}</div>
-        <div class="src-lbl">Unknown</div>
+        <div class="src-lbl">نامشخص</div>
         <div class="src-sub">—</div>
       </div>
     </div>
 
-    <h2>By Status</h2>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <h2>وضعیت سفارش</h2>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;direction:rtl">
       {%- for s in by_status %}
       <span class="badge {% if s.status in ('pending','failed') %}badge-unpaid{% elif s.status == 'on-hold' %}badge-onhold{% elif s.status == 'completed' %}badge-ok{% else %}badge-warn{% endif %}">
-        {{ s.status }}: {{ s.count }}
+        {{ status_fa.get(s.status, s.status) }}: {{ s.count }}
       </span>
       {%- endfor %}
     </div>
   </div>
 
-  {# ── Filter form ───────────────────────────────────────────────── #}
+  {# ── فرم فیلتر ─────────────────────────────────────────────────── #}
   <div class="filter-bar">
     <form method="get" action="{{ url_for('orders_page') }}">
       <div class="fg">
-        <label>Source</label>
+        <label>منبع سفارش</label>
         <select name="order_source">
-          <option value="">All sources</option>
-          <option value="website"  {% if filters.order_source == 'website'  %}selected{% endif %}>Website</option>
-          <option value="basalam"  {% if filters.order_source == 'basalam'  %}selected{% endif %}>Basalam</option>
-          <option value="manual"   {% if filters.order_source == 'manual'   %}selected{% endif %}>Manual</option>
-          <option value="unknown"  {% if filters.order_source == 'unknown'  %}selected{% endif %}>Unknown</option>
+          <option value="">همه منابع</option>
+          <option value="website"  {% if filters.order_source == 'website'  %}selected{% endif %}>سایت</option>
+          <option value="basalam"  {% if filters.order_source == 'basalam'  %}selected{% endif %}>باسلام</option>
+          <option value="manual"   {% if filters.order_source == 'manual'   %}selected{% endif %}>دستی</option>
+          <option value="unknown"  {% if filters.order_source == 'unknown'  %}selected{% endif %}>نامشخص</option>
         </select>
       </div>
       <div class="fg">
-        <label>Status</label>
+        <label>وضعیت</label>
         <select name="status">
-          <option value="">All statuses</option>
+          <option value="">همه وضعیت‌ها</option>
           {%- for s in by_status %}
-          <option value="{{ s.status }}" {% if filters.status == s.status %}selected{% endif %}>{{ s.status }}</option>
+          <option value="{{ s.status }}" {% if filters.status == s.status %}selected{% endif %}>{{ status_fa.get(s.status, s.status) }}</option>
           {%- endfor %}
         </select>
       </div>
       <div class="fg">
-        <label>Has Phone</label>
+        <label>شماره تماس</label>
         <select name="has_phone">
-          <option value="">Any</option>
-          <option value="1" {% if filters.has_phone == '1' %}selected{% endif %}>Yes</option>
-          <option value="0" {% if filters.has_phone == '0' %}selected{% endif %}>No</option>
+          <option value="">همه</option>
+          <option value="1" {% if filters.has_phone == '1' %}selected{% endif %}>دارد</option>
+          <option value="0" {% if filters.has_phone == '0' %}selected{% endif %}>ندارد</option>
         </select>
       </div>
       <div class="fg">
-        <label>Has Email</label>
+        <label>ایمیل</label>
         <select name="has_email">
-          <option value="">Any</option>
-          <option value="1" {% if filters.has_email == '1' %}selected{% endif %}>Yes</option>
-          <option value="0" {% if filters.has_email == '0' %}selected{% endif %}>No</option>
+          <option value="">همه</option>
+          <option value="1" {% if filters.has_email == '1' %}selected{% endif %}>دارد</option>
+          <option value="0" {% if filters.has_email == '0' %}selected{% endif %}>ندارد</option>
         </select>
       </div>
       <div class="fg">
-        <label>Date From</label>
+        <label>از تاریخ</label>
         <input type="date" name="date_from" value="{{ filters.date_from or '' }}">
       </div>
       <div class="fg">
-        <label>Date To</label>
+        <label>تا تاریخ</label>
         <input type="date" name="date_to" value="{{ filters.date_to or '' }}">
       </div>
       <div class="fg" style="flex-direction:row;gap:6px">
-        <button type="submit" class="btn btn-primary">Filter</button>
-        <a href="{{ url_for('orders_page') }}" class="btn btn-secondary">Reset</a>
+        <button type="submit" class="btn btn-primary">اعمال فیلتر</button>
+        <a href="{{ url_for('orders_page') }}" class="btn btn-secondary">پاک‌کردن</a>
       </div>
     </form>
   </div>
 
-  {# ── Order list ────────────────────────────────────────────────── #}
+  {# ── لیست سفارش‌ها ─────────────────────────────────────────────── #}
   <div class="card" style="margin-bottom:20px">
-    <h2>Orders
+    <h2>سفارش‌ها
       <span style="font-weight:400;color:#9ca3af;font-size:.85rem">
-        — showing up to 50 of {{ filtered_total }}
-        {%- if filters.order_source or filters.status %} (filtered){%- endif %}
+        — نمایش تا ۵۰ سفارش از {{ filtered_total }}
+        {%- if filters.order_source or filters.status %} (فیلترشده){%- endif %}
       </span>
     </h2>
     <div class="tbl-wrap">
       <table>
         <thead><tr>
-          <th>ID</th><th>Status</th><th>Source</th><th>Ext. ID</th>
-          <th>Total</th><th>Date</th><th>Phone</th><th>Email</th>
+          <th>شناسه</th><th>وضعیت</th><th>منبع</th><th>شناسه خارجی</th>
+          <th>مبلغ کل</th><th>تاریخ سفارش</th><th>شماره تماس</th><th>ایمیل</th>
         </tr></thead>
         <tbody>
         {%- if orders %}
           {%- for o in orders %}
           <tr>
             <td><strong>#{{ o.id }}</strong></td>
-            <td><span class="badge {% if o.status in ('pending','failed') %}badge-unpaid{% elif o.status == 'on-hold' %}badge-onhold{% elif o.status == 'completed' %}badge-ok{% else %}badge-warn{% endif %}">{{ o.status }}</span></td>
-            <td><span class="badge badge-{{ o.order_source }}">{{ o.order_source }}</span></td>
-            <td style="font-family:monospace;font-size:.8rem">{{ o.external_order_id or '—' }}</td>
-            <td>{{ "{:,.0f}".format(o.total) }} {{ o.currency }}</td>
-            <td style="color:#6b7280;font-size:.82rem">{{ o.date_created }}</td>
-            <td>{% if o.has_phone %}<span class="badge badge-ok" title="{{ o.phone_masked }}">{{ o.phone_masked }}</span>{% else %}<span style="color:#9ca3af">—</span>{% endif %}</td>
-            <td>{% if o.has_email %}<span style="font-size:.78rem">{{ o.email_masked }}</span>{% else %}<span style="color:#9ca3af">—</span>{% endif %}</td>
+            <td><span class="badge {% if o.status in ('pending','failed') %}badge-unpaid{% elif o.status == 'on-hold' %}badge-onhold{% elif o.status == 'completed' %}badge-ok{% else %}badge-warn{% endif %}">{{ status_fa.get(o.status, o.status) }}</span></td>
+            <td><span class="badge badge-{{ o.order_source }}">{{ src_fa.get(o.order_source, o.order_source) }}</span></td>
+            <td style="font-family:monospace;font-size:.8rem;direction:ltr;text-align:left">{{ o.external_order_id or '—' }}</td>
+            <td style="direction:ltr;text-align:left">{{ "{:,.0f}".format(o.total) }} تومان</td>
+            <td style="color:#6b7280;font-size:.82rem;direction:ltr;text-align:left">{{ o.date_created }}</td>
+            <td style="direction:ltr;text-align:left">{% if o.has_phone %}<span class="badge badge-ok" title="{{ o.phone_masked }}">{{ o.phone_masked }}</span>{% else %}<span style="color:#9ca3af">—</span>{% endif %}</td>
+            <td style="direction:ltr;text-align:left;font-size:.78rem">{% if o.has_email %}{{ o.email_masked }}{% else %}<span style="color:#9ca3af">—</span>{% endif %}</td>
           </tr>
           {%- endfor %}
         {%- else %}
-          <tr><td colspan="8" style="text-align:center;color:#9ca3af;padding:24px">No orders match the current filters.</td></tr>
+          <tr><td colspan="8" style="text-align:center;color:#9ca3af;padding:24px">سفارشی با این فیلتر یافت نشد.</td></tr>
         {%- endif %}
         </tbody>
       </table>
     </div>
   </div>
 
-  {# ── Unpaid / recovery candidates ──────────────────────────────── #}
+  {# ── سفارش‌های پرداخت‌نشده / قابل پیگیری ─────────────────────── #}
   <div class="card">
-    <h2>Unpaid / Recovery Candidates
+    <h2>سفارش‌های پرداخت‌نشده / قابل پیگیری
       <span style="font-weight:400;color:#9ca3af;font-size:.85rem">
-        — status: pending, failed, on-hold
+        — وضعیت: در انتظار، ناموفق، در حال انتظار
       </span>
     </h2>
     <div class="tbl-wrap">
       <table>
         <thead><tr>
-          <th>ID</th><th>Status</th><th>Reason</th><th>Source</th><th>Ext. ID</th>
-          <th>Total</th><th>Created</th><th>Age (h)</th><th>Phone</th><th>Email</th>
+          <th>شناسه</th><th>وضعیت</th><th>دلیل</th><th>منبع</th><th>شناسه خارجی</th>
+          <th>مبلغ</th><th>تاریخ ثبت</th><th>ساعت‌های گذشته</th><th>شماره تماس</th><th>ایمیل</th>
         </tr></thead>
         <tbody>
         {%- if unpaid %}
           {%- for o in unpaid %}
           <tr>
             <td><strong>#{{ o.id }}</strong></td>
-            <td><span class="badge {% if o.status == 'failed' %}badge-err{% elif o.status == 'on-hold' %}badge-warn{% else %}badge-unpaid{% endif %}">{{ o.status }}</span></td>
+            <td><span class="badge {% if o.status == 'failed' %}badge-err{% elif o.status == 'on-hold' %}badge-warn{% else %}badge-unpaid{% endif %}">{{ status_fa.get(o.status, o.status) }}</span></td>
             <td style="font-size:.8rem;color:#6b7280">{{ o.recovery_reason }}</td>
-            <td><span class="badge badge-{{ o.order_source }}">{{ o.order_source }}</span></td>
-            <td style="font-family:monospace;font-size:.8rem">{{ o.external_order_id or '—' }}</td>
-            <td>{{ "{:,.0f}".format(o.total) }} {{ o.currency }}</td>
-            <td style="color:#6b7280;font-size:.82rem">{{ o.date_created }}</td>
-            <td style="color:#6b7280">{{ o.age_hours or '—' }}</td>
-            <td>{% if o.has_phone %}<span class="badge badge-ok" title="{{ o.phone_masked }}">{{ o.phone_masked }}</span>{% else %}<span style="color:#9ca3af">—</span>{% endif %}</td>
-            <td>{% if o.has_email %}<span style="font-size:.78rem">{{ o.email_masked }}</span>{% else %}<span style="color:#9ca3af">—</span>{% endif %}</td>
+            <td><span class="badge badge-{{ o.order_source }}">{{ src_fa.get(o.order_source, o.order_source) }}</span></td>
+            <td style="font-family:monospace;font-size:.8rem;direction:ltr;text-align:left">{{ o.external_order_id or '—' }}</td>
+            <td style="direction:ltr;text-align:left">{{ "{:,.0f}".format(o.total) }} تومان</td>
+            <td style="color:#6b7280;font-size:.82rem;direction:ltr;text-align:left">{{ o.date_created }}</td>
+            <td style="color:#6b7280;direction:ltr;text-align:left">{{ o.age_hours or '—' }}</td>
+            <td style="direction:ltr;text-align:left">{% if o.has_phone %}<span class="badge badge-ok">{{ o.phone_masked }}</span>{% else %}<span style="color:#9ca3af">—</span>{% endif %}</td>
+            <td style="direction:ltr;text-align:left;font-size:.78rem">{% if o.has_email %}{{ o.email_masked }}{% else %}<span style="color:#9ca3af">—</span>{% endif %}</td>
           </tr>
           {%- endfor %}
         {%- else %}
-          <tr><td colspan="10" style="text-align:center;color:#22c55e;padding:24px">No unpaid/recovery candidates.</td></tr>
+          <tr><td colspan="10" style="text-align:center;color:#22c55e;padding:24px">هیچ سفارش پرداخت‌نشده‌ای وجود ندارد.</td></tr>
         {%- endif %}
         </tbody>
       </table>
     </div>
+  </div>
+
+  {%- endif %}
+</div>
+{% endblock %}"""
+
+PRODUCTS_PAGE = """\
+{% extends 'base.html' %}
+{% block title %}محصولات — بهداشتیک هاب{% endblock %}
+{% block body %}
+<div class="page">
+  <h1>مدیریت محصولات</h1>
+
+  {%- if not ok %}
+  <div class="alert alert-err">خطا در اتصال به پایگاه داده: {{ error }}</div>
+  {%- else %}
+
+  {# ── خلاصه آماری ────────────────────────────────────────────────── #}
+  <div class="stat-strip">
+    <div class="stat-box">
+      <div class="big">{{ total }}</div>
+      <div class="lbl2">کل محصولات</div>
+    </div>
+    <div class="stat-box">
+      <div class="big" style="color:#16a34a">{{ published_cnt }}</div>
+      <div class="lbl2">محصولات منتشرشده</div>
+    </div>
+    <div class="stat-box">
+      <div class="big" style="color:#6b7280">{{ draft_cnt }}</div>
+      <div class="lbl2">پیش‌نویس</div>
+    </div>
+    <div class="stat-box">
+      <div class="big" style="color:#dc2626">{{ outofstock_cnt }}</div>
+      <div class="lbl2">محصولات ناموجود</div>
+    </div>
+    <div class="stat-box">
+      <div class="big" style="color:#d97706">{{ no_price_cnt }}</div>
+      <div class="lbl2">بدون قیمت</div>
+    </div>
+    <div class="stat-box">
+      <div class="big" style="color:#7c3aed">{{ no_image_cnt }}</div>
+      <div class="lbl2">بدون تصویر</div>
+    </div>
+  </div>
+
+  {# ── فرم جستجو و فیلتر ─────────────────────────────────────────── #}
+  <div class="filter-bar">
+    <form method="get" action="{{ url_for('products_page') }}">
+      <div class="fg" style="min-width:180px">
+        <label>جستجوی محصول</label>
+        <input type="text" name="search" placeholder="نام یا کد SKU..." value="{{ filters.search or '' }}">
+      </div>
+      <div class="fg">
+        <label>وضعیت انتشار</label>
+        <select name="status">
+          <option value="">همه</option>
+          <option value="publish" {% if filters.status == 'publish' %}selected{% endif %}>منتشرشده</option>
+          <option value="draft"   {% if filters.status == 'draft'   %}selected{% endif %}>پیش‌نویس</option>
+          <option value="private" {% if filters.status == 'private' %}selected{% endif %}>خصوصی</option>
+        </select>
+      </div>
+      <div class="fg">
+        <label>وضعیت موجودی</label>
+        <select name="stock_status">
+          <option value="">همه</option>
+          <option value="instock"     {% if filters.stock_status == 'instock'     %}selected{% endif %}>موجود</option>
+          <option value="outofstock"  {% if filters.stock_status == 'outofstock'  %}selected{% endif %}>ناموجود</option>
+          <option value="onbackorder" {% if filters.stock_status == 'onbackorder' %}selected{% endif %}>پیش‌سفارش</option>
+        </select>
+      </div>
+      <div class="fg">
+        <label>قیمت</label>
+        <select name="has_price">
+          <option value="">همه</option>
+          <option value="1" {% if filters.has_price == '1' %}selected{% endif %}>دارد</option>
+          <option value="0" {% if filters.has_price == '0' %}selected{% endif %}>ندارد</option>
+        </select>
+      </div>
+      <div class="fg">
+        <label>تصویر</label>
+        <select name="has_image">
+          <option value="">همه</option>
+          <option value="1" {% if filters.has_image == '1' %}selected{% endif %}>دارد</option>
+          <option value="0" {% if filters.has_image == '0' %}selected{% endif %}>ندارد</option>
+        </select>
+      </div>
+      {%- if categories %}
+      <div class="fg">
+        <label>دسته‌بندی</label>
+        <select name="category_id">
+          <option value="">همه دسته‌ها</option>
+          {%- for c in categories %}
+          <option value="{{ c.id }}" {% if filters.category_id == c.id|string %}selected{% endif %}>{{ c.name }}</option>
+          {%- endfor %}
+        </select>
+      </div>
+      {%- endif %}
+      {%- if brands %}
+      <div class="fg">
+        <label>برند</label>
+        <select name="brand_id">
+          <option value="">همه برندها</option>
+          {%- for b in brands %}
+          <option value="{{ b.id }}" {% if filters.brand_id == b.id|string %}selected{% endif %}>{{ b.name }}</option>
+          {%- endfor %}
+        </select>
+      </div>
+      {%- endif %}
+      <div class="fg" style="flex-direction:row;gap:6px">
+        <button type="submit" class="btn btn-primary">اعمال فیلتر</button>
+        <a href="{{ url_for('products_page') }}" class="btn btn-secondary">پاک‌کردن</a>
+      </div>
+    </form>
+  </div>
+
+  {# ── لیست محصولات ──────────────────────────────────────────────── #}
+  <div class="card">
+    <h2>محصولات
+      <span style="font-weight:400;color:#9ca3af;font-size:.85rem">
+        — نمایش {{ products|length }} از {{ filtered_total }}
+        {%- if filters.search or filters.status or filters.stock_status %} (فیلترشده){%- endif %}
+      </span>
+    </h2>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr>
+          <th>شناسه</th>
+          <th>نام محصول</th>
+          <th>وضعیت</th>
+          <th>کد SKU</th>
+          <th>قیمت (تومان)</th>
+          <th>موجودی</th>
+          <th>تعداد</th>
+          <th>دسته‌بندی</th>
+          <th>برند</th>
+          <th>تصویر</th>
+          <th>آخرین بروزرسانی</th>
+          <th>مشاهده</th>
+        </tr></thead>
+        <tbody>
+        {%- if products %}
+          {%- for p in products %}
+          <tr>
+            <td><strong>#{{ p.id }}</strong></td>
+            <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ p.title }}">{{ p.title }}</td>
+            <td><span class="badge {% if p.status == 'publish' %}badge-ok{% elif p.status == 'draft' %}badge-warn{% else %}badge-err{% endif %}">{{ prod_status_fa.get(p.status, p.status) }}</span></td>
+            <td style="font-family:monospace;font-size:.8rem;direction:ltr;text-align:left">{{ p.sku or '—' }}</td>
+            <td style="direction:ltr;text-align:left">
+              {%- if p.min_price > 0 %}
+                {{ "{:,.0f}".format(p.min_price) }}
+                {%- if p.max_price > p.min_price %} – {{ "{:,.0f}".format(p.max_price) }}{%- endif %}
+              {%- else %}—{%- endif %}
+            </td>
+            <td><span class="badge {% if p.stock_status == 'instock' %}badge-ok{% elif p.stock_status == 'onbackorder' %}badge-warn{% else %}badge-err{% endif %}">{{ stock_fa.get(p.stock_status, p.stock_status) }}</span></td>
+            <td style="direction:ltr;text-align:left;color:#6b7280">{{ p.stock_qty if p.stock_qty is not none else '—' }}</td>
+            <td style="font-size:.8rem;color:#374151">{{ p.categories }}</td>
+            <td style="font-size:.8rem;color:#374151">{{ p.brands }}</td>
+            <td style="text-align:center">
+              {%- if p.image_local == 'downloaded' %}
+                <span class="badge badge-ok" title="دانلودشده">✓</span>
+              {%- elif p.has_image %}
+                <span class="badge badge-warn" title="در سایت موجود است">▲</span>
+              {%- else %}
+                <span style="color:#9ca3af">—</span>
+              {%- endif %}
+            </td>
+            <td style="color:#6b7280;font-size:.82rem;direction:ltr;text-align:left">{{ p.modified }}</td>
+            <td>
+              {%- if p.url %}
+              <a href="{{ p.url }}" target="_blank" class="btn btn-secondary" style="padding:3px 10px;font-size:.78rem">مشاهده</a>
+              {%- else %}—{%- endif %}
+            </td>
+          </tr>
+          {%- endfor %}
+        {%- else %}
+          <tr><td colspan="12" style="text-align:center;color:#9ca3af;padding:24px">محصولی با این فیلتر یافت نشد.</td></tr>
+        {%- endif %}
+        </tbody>
+      </table>
+    </div>
+
+    {# ── صفحه‌بندی ──────────────────────────────────────────────── #}
+    {%- if total_pages > 1 %}
+    <div style="display:flex;gap:8px;justify-content:center;padding:16px 0;flex-wrap:wrap">
+      {%- if page > 1 %}
+      <a href="?{{ filters_qs }}&page={{ page - 1 }}" class="btn btn-secondary">‹ قبلی</a>
+      {%- endif %}
+      <span style="padding:6px 12px;color:#6b7280;font-size:.88rem">صفحه {{ page }} از {{ total_pages }}</span>
+      {%- if page < total_pages %}
+      <a href="?{{ filters_qs }}&page={{ page + 1 }}" class="btn btn-secondary">بعدی ›</a>
+      {%- endif %}
+    </div>
+    {%- endif %}
   </div>
 
   {%- endif %}
@@ -1311,6 +1719,7 @@ app.jinja_loader = jinja2.DictLoader({
     "users.html":     USERS_PAGE,
     "webhooks.html":  WEBHOOKS_PAGE,
     "orders.html":    ORDERS_PAGE,
+    "products.html":  PRODUCTS_PAGE,
 })
 
 
@@ -1453,7 +1862,35 @@ def orders_page():
         "date_to":      request.args.get("date_to", ""),
     }
     d = get_orders_page_data(filters)
-    return _render("orders.html", active="orders", filters=filters, **d)
+    return _render("orders.html", active="orders", filters=filters,
+                   src_fa=_ORDER_SRC_FA, status_fa=_STATUS_FA, **d)
+
+
+@app.route("/products")
+def products_page():
+    redir = _require_login()
+    if redir:
+        return redir
+
+    filters = {
+        "search":       request.args.get("search", ""),
+        "status":       request.args.get("status", ""),
+        "stock_status": request.args.get("stock_status", ""),
+        "has_price":    request.args.get("has_price", ""),
+        "has_image":    request.args.get("has_image", ""),
+        "category_id":  request.args.get("category_id", ""),
+        "brand_id":     request.args.get("brand_id", ""),
+        "page":         request.args.get("page", "1"),
+    }
+    # Build query-string for pagination links (without page param)
+    qs_parts = [f"{k}={v}" for k, v in filters.items() if v and k != "page"]
+    filters_qs = "&".join(qs_parts)
+
+    d = get_products_page_data(filters)
+    return _render("products.html", active="products", filters=filters,
+                   filters_qs=filters_qs,
+                   stock_fa=_STOCK_STATUS_FA,
+                   prod_status_fa=_PRODUCT_STATUS_FA, **d)
 
 
 # ---------------------------------------------------------------------------
