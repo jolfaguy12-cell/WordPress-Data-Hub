@@ -8,13 +8,13 @@
     "port": 3306,
     "user": "mirror_import_user",
     "password": "strong-password-here",
-    "name": "behdashtik_wp_mirror",
+    "name": "behdashtik_wp_mirror_dev",
     "readonly_user": "mirror_readonly_user",
     "readonly_password": "readonly-password-here"
   },
-  "_comment_hub_state_db": "Optional. Defaults to same host/creds as mirror_db, DB name behdashtik_hub_state. Override only if the hub needs a separate MySQL account.",
+  "_comment_hub_state_db": "Required for dev/test instances. Use a distinct name per environment to avoid collisions (e.g. behdashtik_hub_state_dev for dev, behdashtik_hub_state for prod).",
   "hub_state_db": {
-    "name": "behdashtik_hub_state"
+    "name": "behdashtik_hub_state_dev"
   },
   "poll_interval_seconds": 5,
   "poll_timeout_seconds": 3600,
