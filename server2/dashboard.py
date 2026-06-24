@@ -26,6 +26,8 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 import jinja2
+import pymysql
+import pymysql.cursors
 from flask import (Flask, Response, flash, redirect, render_template,
                    request, session, url_for)
 from data_api import data_api as data_api_bp
@@ -90,6 +92,275 @@ def _db():
         conn.commit()
     finally:
         conn.close()
+
+
+@contextmanager
+def _mirror_db():
+    cfg = load_config()
+    db  = cfg["mirror_db"]
+    conn = pymysql.connect(
+        host=db["host"], port=db.get("port", 3306),
+        user=db.get("readonly_user", db["user"]),
+        password=db.get("readonly_password", db["password"]),
+        database=db["name"],
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        init_command="SET sql_mode=''",
+        connect_timeout=5,
+    )
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def get_orders_page_data(filters: dict) -> dict:
+    """Fetch all data needed for the Orders page from the mirror DB."""
+    status_f    = filters.get("status", "")
+    source_f    = filters.get("order_source", "")
+    has_phone_f = filters.get("has_phone", "")
+    has_email_f = filters.get("has_email", "")
+    date_from   = filters.get("date_from", "")
+    date_to     = filters.get("date_to", "")
+
+    _BS = "SELECT order_id FROM wp_wc_orders_meta WHERE meta_key='_sync_basalam_hash_id'"
+    _OP = "SELECT order_id FROM wp_wc_order_operational_data WHERE created_via=%s"
+
+    try:
+        with _mirror_db() as conn:
+            with conn.cursor() as cur:
+                # ── Summary stats ────────────────────────────────────────────
+                cur.execute(
+                    "SELECT COUNT(*) as cnt, SUM(total_amount) as total_sales"
+                    " FROM wp_wc_orders WHERE type='shop_order'"
+                )
+                t = cur.fetchone()
+                total_orders = int(t["cnt"] or 0)
+                total_sales  = float(t["total_sales"] or 0)
+
+                cur.execute(
+                    "SELECT COUNT(*) as cnt FROM wp_wc_orders"
+                    " WHERE type='shop_order' AND status IN ('wc-pending','wc-failed','wc-on-hold')"
+                )
+                unpaid_count = int(cur.fetchone()["cnt"] or 0)
+
+                # By-status
+                cur.execute(
+                    "SELECT status, COUNT(*) as cnt FROM wp_wc_orders"
+                    " WHERE type='shop_order' GROUP BY status ORDER BY cnt DESC"
+                )
+                by_status = [
+                    {"status": (r["status"][3:] if r["status"].startswith("wc-") else r["status"]),
+                     "count": r["cnt"]}
+                    for r in cur.fetchall()
+                ]
+
+                # By-source (Basalam / website / manual / unknown)
+                cur.execute(
+                    f"SELECT COUNT(*) as cnt, COALESCE(SUM(o.total_amount),0) as sales"
+                    f" FROM wp_wc_orders o WHERE o.type='shop_order' AND o.id IN ({_BS})"
+                )
+                bs = cur.fetchone(); basalam_cnt = int(bs["cnt"]); basalam_sales = float(bs["sales"])
+                cur.execute(
+                    f"SELECT COUNT(*) as cnt, COALESCE(SUM(o.total_amount),0) as sales"
+                    f" FROM wp_wc_orders o JOIN wp_wc_order_operational_data op ON op.order_id=o.id"
+                    f" WHERE o.type='shop_order' AND op.created_via='checkout' AND o.id NOT IN ({_BS})"
+                )
+                ws = cur.fetchone(); website_cnt = int(ws["cnt"]); website_sales = float(ws["sales"])
+                cur.execute(
+                    f"SELECT COUNT(*) as cnt, COALESCE(SUM(o.total_amount),0) as sales"
+                    f" FROM wp_wc_orders o JOIN wp_wc_order_operational_data op ON op.order_id=o.id"
+                    f" WHERE o.type='shop_order' AND op.created_via='admin' AND o.id NOT IN ({_BS})"
+                )
+                ma = cur.fetchone(); manual_cnt = int(ma["cnt"]); manual_sales = float(ma["sales"])
+                unknown_cnt = max(0, total_orders - basalam_cnt - website_cnt - manual_cnt)
+
+                # Contact availability
+                cur.execute(
+                    "SELECT"
+                    " SUM(CASE WHEN billing_email IS NOT NULL AND billing_email != '' THEN 1 ELSE 0 END) as he,"
+                    " COUNT(*) as tot FROM wp_wc_orders WHERE type='shop_order'"
+                )
+                cr = cur.fetchone(); has_email_cnt = int(cr["he"] or 0)
+                cur.execute(
+                    f"SELECT COUNT(DISTINCT a.order_id) as hp"
+                    f" FROM wp_wc_order_addresses a JOIN wp_wc_orders o ON o.id=a.order_id"
+                    f" WHERE o.type='shop_order' AND a.address_type='billing'"
+                    f" AND a.phone IS NOT NULL AND a.phone != ''"
+                )
+                has_phone_cnt = int(cur.fetchone()["hp"] or 0)
+
+                # ── Filtered order list ──────────────────────────────────────
+                where:  list[str] = ["o.type = 'shop_order'"]
+                params: list      = []
+                if status_f:
+                    s = status_f if status_f.startswith("wc-") else f"wc-{status_f}"
+                    where.append("o.status = %s"); params.append(s)
+                if source_f == "basalam":
+                    where.append(f"o.id IN ({_BS})")
+                elif source_f == "website":
+                    where.append(f"o.id NOT IN ({_BS})")
+                    where.append(f"o.id IN ({_OP})"); params.append("checkout")
+                elif source_f == "manual":
+                    where.append(f"o.id NOT IN ({_BS})")
+                    where.append(f"o.id IN ({_OP})"); params.append("admin")
+                elif source_f == "unknown":
+                    where.append(f"o.id NOT IN ({_BS})")
+                    where.append("o.id NOT IN (SELECT order_id FROM wp_wc_order_operational_data WHERE created_via IN ('checkout','admin'))")
+                if date_from:
+                    where.append("o.date_created_gmt >= %s"); params.append(date_from)
+                if date_to:
+                    where.append("o.date_created_gmt <= %s"); params.append(date_to)
+                if has_email_f == "1":
+                    where.append("o.billing_email IS NOT NULL AND o.billing_email != ''")
+                elif has_email_f == "0":
+                    where.append("(o.billing_email IS NULL OR o.billing_email = '')")
+                if has_phone_f == "1":
+                    where.append("EXISTS (SELECT 1 FROM wp_wc_order_addresses pa WHERE pa.order_id=o.id AND pa.address_type='billing' AND pa.phone IS NOT NULL AND pa.phone != '')")
+                elif has_phone_f == "0":
+                    where.append("NOT EXISTS (SELECT 1 FROM wp_wc_order_addresses pa WHERE pa.order_id=o.id AND pa.address_type='billing' AND pa.phone IS NOT NULL AND pa.phone != '')")
+
+                where_sql = " AND ".join(where)
+                cur.execute(f"SELECT COUNT(*) as cnt FROM wp_wc_orders o WHERE {where_sql}", params)
+                filtered_total = int(cur.fetchone()["cnt"] or 0)
+
+                cur.execute(
+                    f"SELECT o.id, o.status, o.currency, o.total_amount, o.customer_id,"
+                    f" o.billing_email, o.date_created_gmt, o.payment_method"
+                    f" FROM wp_wc_orders o WHERE {where_sql}"
+                    f" ORDER BY o.id DESC LIMIT 50",
+                    params,
+                )
+                order_rows = cur.fetchall()
+                order_ids = [r["id"] for r in order_rows]
+
+                src_map: dict = {}; op_map: dict = {}; phone_map: dict = {}
+                if order_ids:
+                    ph = ",".join(["%s"] * len(order_ids))
+                    cur.execute(
+                        f"SELECT order_id, meta_value FROM wp_wc_orders_meta"
+                        f" WHERE order_id IN ({ph}) AND meta_key='_sync_basalam_hash_id'",
+                        order_ids,
+                    )
+                    src_map = {r["order_id"]: r["meta_value"] for r in cur.fetchall()}
+                    cur.execute(
+                        f"SELECT order_id, created_via FROM wp_wc_order_operational_data WHERE order_id IN ({ph})",
+                        order_ids,
+                    )
+                    op_map = {r["order_id"]: (r["created_via"] or "") for r in cur.fetchall()}
+                    cur.execute(
+                        f"SELECT order_id, phone FROM wp_wc_order_addresses"
+                        f" WHERE order_id IN ({ph}) AND address_type='billing'",
+                        order_ids,
+                    )
+                    phone_map = {r["order_id"]: r["phone"] for r in cur.fetchall()}
+
+                def _src(oid):
+                    bs = src_map.get(oid); cv = op_map.get(oid, "")
+                    if bs:    return "basalam", bs
+                    if cv == "checkout": return "website", None
+                    if cv == "admin":    return "manual",  None
+                    return "unknown", None
+
+                def _mphone(p): return f"{p[:3]}***{p[-2:]}" if p and len(p) > 5 else ("***" if p else None)
+                def _memail(e):
+                    if not e: return None
+                    try: l,d=e.split("@",1); return f"{l[:1]}***@{d}"
+                    except: return "***"
+
+                orders = []
+                for r in order_rows:
+                    oid  = r["id"]
+                    st   = r["status"]
+                    src, ext_id = _src(oid)
+                    phone = phone_map.get(oid)
+                    orders.append({
+                        "id": oid,
+                        "status": st[3:] if st.startswith("wc-") else st,
+                        "currency": r["currency"] or "IRR",
+                        "total": float(r["total_amount"] or 0),
+                        "date_created": str(r["date_created_gmt"] or "")[:16],
+                        "order_source": src,
+                        "external_order_id": ext_id,
+                        "phone_masked": _mphone(phone),
+                        "email_masked": _memail(r["billing_email"]),
+                        "has_phone": bool(phone),
+                        "has_email": bool(r["billing_email"]),
+                    })
+
+                # ── Unpaid / recovery candidates ─────────────────────────────
+                cur.execute(
+                    "SELECT o.id, o.status, o.currency, o.total_amount, o.billing_email,"
+                    " o.date_created_gmt, o.payment_method"
+                    " FROM wp_wc_orders o"
+                    " WHERE o.type='shop_order' AND o.status IN ('wc-pending','wc-failed','wc-on-hold')"
+                    " ORDER BY o.date_created_gmt ASC LIMIT 100"
+                )
+                unpaid_rows = cur.fetchall()
+                unpaid_ids  = [r["id"] for r in unpaid_rows]
+                up_src: dict = {}; up_op: dict = {}; up_phone: dict = {}
+                if unpaid_ids:
+                    ph2 = ",".join(["%s"] * len(unpaid_ids))
+                    cur.execute(f"SELECT order_id, meta_value FROM wp_wc_orders_meta WHERE order_id IN ({ph2}) AND meta_key='_sync_basalam_hash_id'", unpaid_ids)
+                    up_src = {r["order_id"]: r["meta_value"] for r in cur.fetchall()}
+                    cur.execute(f"SELECT order_id, created_via FROM wp_wc_order_operational_data WHERE order_id IN ({ph2})", unpaid_ids)
+                    up_op  = {r["order_id"]: (r["created_via"] or "") for r in cur.fetchall()}
+                    cur.execute(f"SELECT order_id, phone FROM wp_wc_order_addresses WHERE order_id IN ({ph2}) AND address_type='billing'", unpaid_ids)
+                    up_phone = {r["order_id"]: r["phone"] for r in cur.fetchall()}
+
+                reason_map = {"wc-pending": "pending_payment", "wc-failed": "payment_failed", "wc-on-hold": "on_hold"}
+                now_utc = datetime.now(timezone.utc)
+
+                unpaid = []
+                for r in unpaid_rows:
+                    oid = r["id"]; st = r["status"]
+                    bs = up_src.get(oid); cv = up_op.get(oid, "")
+                    if bs:  src2, ext2 = "basalam", bs
+                    elif cv == "checkout": src2, ext2 = "website", None
+                    elif cv == "admin":    src2, ext2 = "manual",  None
+                    else:                  src2, ext2 = "unknown", None
+                    phone2 = up_phone.get(oid)
+                    age_h = None
+                    if r["date_created_gmt"]:
+                        try:
+                            dt = r["date_created_gmt"]
+                            if not isinstance(dt, datetime):
+                                dt = datetime.fromisoformat(str(dt))
+                            age_h = round((now_utc - dt.replace(tzinfo=timezone.utc)).total_seconds() / 3600, 1)
+                        except Exception:
+                            pass
+                    unpaid.append({
+                        "id": oid,
+                        "status": st[3:] if st.startswith("wc-") else st,
+                        "currency": r["currency"] or "IRR",
+                        "total": float(r["total_amount"] or 0),
+                        "date_created": str(r["date_created_gmt"] or "")[:16],
+                        "order_source": src2,
+                        "external_order_id": ext2,
+                        "phone_masked": _mphone(phone2),
+                        "email_masked": _memail(r["billing_email"]),
+                        "has_phone": bool(phone2),
+                        "has_email": bool(r["billing_email"]),
+                        "age_hours": age_h,
+                        "recovery_reason": reason_map.get(st, "unpaid"),
+                    })
+
+        return {
+            "ok": True,
+            "total_orders": total_orders,
+            "total_sales": total_sales,
+            "unpaid_count": unpaid_count,
+            "basalam_cnt": basalam_cnt, "basalam_sales": basalam_sales,
+            "website_cnt": website_cnt, "website_sales": website_sales,
+            "manual_cnt":  manual_cnt,  "manual_sales":  manual_sales,
+            "unknown_cnt": unknown_cnt,
+            "has_email_cnt": has_email_cnt, "has_phone_cnt": has_phone_cnt,
+            "by_status": by_status,
+            "orders": orders, "filtered_total": filtered_total,
+            "unpaid": unpaid,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def get_user_by_id(uid: int) -> sqlite3.Row | None:
@@ -438,6 +709,45 @@ tr:last-child td { border-bottom: none }
 .url-cell { max-width: 260px; overflow: hidden; text-overflow: ellipsis;
             white-space: nowrap; font-size: .82rem; color: #6b7280 }
 
+/* Source badges */
+.badge-basalam { background: #fef3c7; color: #92400e }
+.badge-website { background: #dbeafe; color: #1e40af }
+.badge-manual  { background: #f3e8ff; color: #6b21a8 }
+.badge-unknown { background: #f1f5f9; color: #475569 }
+.badge-unpaid  { background: #fee2e2; color: #991b1b }
+.badge-onhold  { background: #fef9c3; color: #854d0e }
+
+/* Stat row for source breakdown */
+.src-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px }
+.src-card { flex: 1; min-width: 120px; background: #f8fafc; border-radius: 8px;
+            padding: 12px 16px; text-align: center }
+.src-card .src-num { font-size: 1.6rem; font-weight: 800; color: #1e293b }
+.src-card .src-lbl { font-size: .75rem; color: #6b7280; text-transform: uppercase;
+                     letter-spacing: .05em; margin-top: 2px }
+.src-card .src-sub { font-size: .72rem; color: #9ca3af; margin-top: 2px }
+
+/* Compact filter form */
+.filter-bar { background: #fff; border-radius: 10px; padding: 16px 20px;
+              box-shadow: 0 1px 3px rgba(0,0,0,.06); margin-bottom: 20px }
+.filter-bar form { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end }
+.filter-bar .fg  { display: flex; flex-direction: column; gap: 4px; min-width: 130px }
+.filter-bar label { font-size: .78rem; font-weight: 500; color: #6b7280 }
+.filter-bar select, .filter-bar input[type=text], .filter-bar input[type=date] {
+  padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px;
+  font-size: .85rem; outline: none }
+.filter-bar select:focus, .filter-bar input:focus { border-color: #3b82f6 }
+
+/* Stat summary strip */
+.stat-strip { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 20px }
+.stat-box { background: #fff; border-radius: 10px; padding: 16px 20px; flex: 1;
+            min-width: 140px; box-shadow: 0 1px 3px rgba(0,0,0,.06) }
+.stat-box .big  { font-size: 2rem; font-weight: 800; color: #1e293b; line-height: 1 }
+.stat-box .lbl2 { font-size: .78rem; color: #9ca3af; margin-top: 4px; text-transform: uppercase;
+                  letter-spacing: .05em }
+
+/* Scrollable table wrapper */
+.tbl-wrap { overflow-x: auto }
+
 @media (max-width: 600px) {
   .page { padding: 16px }
   .grid { grid-template-columns: 1fr }
@@ -460,6 +770,7 @@ BASE = """\
 <nav class="nav">
   <span class="brand">&#x1F4CA; Behdashtik Hub</span>
   <a href="{{ url_for('dashboard') }}" class="{{ 'active' if active == 'dashboard' }}">Dashboard</a>
+  <a href="{{ url_for('orders_page') }}" class="{{ 'active' if active == 'orders' }}">Orders</a>
   <a href="{{ url_for('users_page') }}" class="{{ 'active' if active == 'users' }}">Users</a>
   <a href="{{ url_for('webhooks_page') }}" class="{{ 'active' if active == 'webhooks' }}">Webhooks</a>
   <span class="spacer"></span>
@@ -789,6 +1100,208 @@ WEBHOOKS_PAGE = """\
 </div>
 {% endblock %}"""
 
+ORDERS_PAGE = """\
+{% extends 'base.html' %}
+{% block title %}Orders — Behdashtik Hub{% endblock %}
+{% block body %}
+<div class="page">
+  <h1>Order Reporting</h1>
+
+  {%- if not ok %}
+  <div class="alert alert-err">Mirror DB error: {{ error }}</div>
+  {%- else %}
+
+  {# ── Summary strip ─────────────────────────────────────────────── #}
+  <div class="stat-strip">
+    <div class="stat-box">
+      <div class="big">{{ total_orders }}</div>
+      <div class="lbl2">Total Orders</div>
+    </div>
+    <div class="stat-box">
+      <div class="big">{{ "{:,.0f}".format(total_sales) }}</div>
+      <div class="lbl2">Total Sales (IRR)</div>
+    </div>
+    <div class="stat-box">
+      <div class="big" style="color:{% if unpaid_count > 0 %}#dc2626{% else %}#22c55e{% endif %}">{{ unpaid_count }}</div>
+      <div class="lbl2">Unpaid / Recovery</div>
+    </div>
+    <div class="stat-box">
+      <div class="big" style="color:#92400e">{{ basalam_cnt }}</div>
+      <div class="lbl2">Basalam Orders</div>
+      <div style="font-size:.72rem;color:#9ca3af">{{ "{:,.0f}".format(basalam_sales) }} IRR</div>
+    </div>
+    <div class="stat-box">
+      <div class="big">{{ has_phone_cnt }}/{{ has_email_cnt }}</div>
+      <div class="lbl2">Has Phone / Email</div>
+    </div>
+  </div>
+
+  {# ── By-source breakdown ───────────────────────────────────────── #}
+  <div class="card" style="margin-bottom:20px">
+    <h2>By Source</h2>
+    <div class="src-row">
+      <div class="src-card">
+        <div class="src-num" style="color:#1e40af">{{ website_cnt }}</div>
+        <div class="src-lbl">Website</div>
+        <div class="src-sub">{{ "{:,.0f}".format(website_sales) }}</div>
+      </div>
+      <div class="src-card">
+        <div class="src-num" style="color:#92400e">{{ basalam_cnt }}</div>
+        <div class="src-lbl">Basalam</div>
+        <div class="src-sub">{{ "{:,.0f}".format(basalam_sales) }}</div>
+      </div>
+      <div class="src-card">
+        <div class="src-num" style="color:#6b21a8">{{ manual_cnt }}</div>
+        <div class="src-lbl">Manual</div>
+        <div class="src-sub">{{ "{:,.0f}".format(manual_sales) }}</div>
+      </div>
+      <div class="src-card">
+        <div class="src-num" style="color:#475569">{{ unknown_cnt }}</div>
+        <div class="src-lbl">Unknown</div>
+        <div class="src-sub">—</div>
+      </div>
+    </div>
+
+    <h2>By Status</h2>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      {%- for s in by_status %}
+      <span class="badge {% if s.status in ('pending','failed') %}badge-unpaid{% elif s.status == 'on-hold' %}badge-onhold{% elif s.status == 'completed' %}badge-ok{% else %}badge-warn{% endif %}">
+        {{ s.status }}: {{ s.count }}
+      </span>
+      {%- endfor %}
+    </div>
+  </div>
+
+  {# ── Filter form ───────────────────────────────────────────────── #}
+  <div class="filter-bar">
+    <form method="get" action="{{ url_for('orders_page') }}">
+      <div class="fg">
+        <label>Source</label>
+        <select name="order_source">
+          <option value="">All sources</option>
+          <option value="website"  {% if filters.order_source == 'website'  %}selected{% endif %}>Website</option>
+          <option value="basalam"  {% if filters.order_source == 'basalam'  %}selected{% endif %}>Basalam</option>
+          <option value="manual"   {% if filters.order_source == 'manual'   %}selected{% endif %}>Manual</option>
+          <option value="unknown"  {% if filters.order_source == 'unknown'  %}selected{% endif %}>Unknown</option>
+        </select>
+      </div>
+      <div class="fg">
+        <label>Status</label>
+        <select name="status">
+          <option value="">All statuses</option>
+          {%- for s in by_status %}
+          <option value="{{ s.status }}" {% if filters.status == s.status %}selected{% endif %}>{{ s.status }}</option>
+          {%- endfor %}
+        </select>
+      </div>
+      <div class="fg">
+        <label>Has Phone</label>
+        <select name="has_phone">
+          <option value="">Any</option>
+          <option value="1" {% if filters.has_phone == '1' %}selected{% endif %}>Yes</option>
+          <option value="0" {% if filters.has_phone == '0' %}selected{% endif %}>No</option>
+        </select>
+      </div>
+      <div class="fg">
+        <label>Has Email</label>
+        <select name="has_email">
+          <option value="">Any</option>
+          <option value="1" {% if filters.has_email == '1' %}selected{% endif %}>Yes</option>
+          <option value="0" {% if filters.has_email == '0' %}selected{% endif %}>No</option>
+        </select>
+      </div>
+      <div class="fg">
+        <label>Date From</label>
+        <input type="date" name="date_from" value="{{ filters.date_from or '' }}">
+      </div>
+      <div class="fg">
+        <label>Date To</label>
+        <input type="date" name="date_to" value="{{ filters.date_to or '' }}">
+      </div>
+      <div class="fg" style="flex-direction:row;gap:6px">
+        <button type="submit" class="btn btn-primary">Filter</button>
+        <a href="{{ url_for('orders_page') }}" class="btn btn-secondary">Reset</a>
+      </div>
+    </form>
+  </div>
+
+  {# ── Order list ────────────────────────────────────────────────── #}
+  <div class="card" style="margin-bottom:20px">
+    <h2>Orders
+      <span style="font-weight:400;color:#9ca3af;font-size:.85rem">
+        — showing up to 50 of {{ filtered_total }}
+        {%- if filters.order_source or filters.status %} (filtered){%- endif %}
+      </span>
+    </h2>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr>
+          <th>ID</th><th>Status</th><th>Source</th><th>Ext. ID</th>
+          <th>Total</th><th>Date</th><th>Phone</th><th>Email</th>
+        </tr></thead>
+        <tbody>
+        {%- if orders %}
+          {%- for o in orders %}
+          <tr>
+            <td><strong>#{{ o.id }}</strong></td>
+            <td><span class="badge {% if o.status in ('pending','failed') %}badge-unpaid{% elif o.status == 'on-hold' %}badge-onhold{% elif o.status == 'completed' %}badge-ok{% else %}badge-warn{% endif %}">{{ o.status }}</span></td>
+            <td><span class="badge badge-{{ o.order_source }}">{{ o.order_source }}</span></td>
+            <td style="font-family:monospace;font-size:.8rem">{{ o.external_order_id or '—' }}</td>
+            <td>{{ "{:,.0f}".format(o.total) }} {{ o.currency }}</td>
+            <td style="color:#6b7280;font-size:.82rem">{{ o.date_created }}</td>
+            <td>{% if o.has_phone %}<span class="badge badge-ok" title="{{ o.phone_masked }}">{{ o.phone_masked }}</span>{% else %}<span style="color:#9ca3af">—</span>{% endif %}</td>
+            <td>{% if o.has_email %}<span style="font-size:.78rem">{{ o.email_masked }}</span>{% else %}<span style="color:#9ca3af">—</span>{% endif %}</td>
+          </tr>
+          {%- endfor %}
+        {%- else %}
+          <tr><td colspan="8" style="text-align:center;color:#9ca3af;padding:24px">No orders match the current filters.</td></tr>
+        {%- endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  {# ── Unpaid / recovery candidates ──────────────────────────────── #}
+  <div class="card">
+    <h2>Unpaid / Recovery Candidates
+      <span style="font-weight:400;color:#9ca3af;font-size:.85rem">
+        — status: pending, failed, on-hold
+      </span>
+    </h2>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr>
+          <th>ID</th><th>Status</th><th>Reason</th><th>Source</th><th>Ext. ID</th>
+          <th>Total</th><th>Created</th><th>Age (h)</th><th>Phone</th><th>Email</th>
+        </tr></thead>
+        <tbody>
+        {%- if unpaid %}
+          {%- for o in unpaid %}
+          <tr>
+            <td><strong>#{{ o.id }}</strong></td>
+            <td><span class="badge {% if o.status == 'failed' %}badge-err{% elif o.status == 'on-hold' %}badge-warn{% else %}badge-unpaid{% endif %}">{{ o.status }}</span></td>
+            <td style="font-size:.8rem;color:#6b7280">{{ o.recovery_reason }}</td>
+            <td><span class="badge badge-{{ o.order_source }}">{{ o.order_source }}</span></td>
+            <td style="font-family:monospace;font-size:.8rem">{{ o.external_order_id or '—' }}</td>
+            <td>{{ "{:,.0f}".format(o.total) }} {{ o.currency }}</td>
+            <td style="color:#6b7280;font-size:.82rem">{{ o.date_created }}</td>
+            <td style="color:#6b7280">{{ o.age_hours or '—' }}</td>
+            <td>{% if o.has_phone %}<span class="badge badge-ok" title="{{ o.phone_masked }}">{{ o.phone_masked }}</span>{% else %}<span style="color:#9ca3af">—</span>{% endif %}</td>
+            <td>{% if o.has_email %}<span style="font-size:.78rem">{{ o.email_masked }}</span>{% else %}<span style="color:#9ca3af">—</span>{% endif %}</td>
+          </tr>
+          {%- endfor %}
+        {%- else %}
+          <tr><td colspan="10" style="text-align:center;color:#22c55e;padding:24px">No unpaid/recovery candidates.</td></tr>
+        {%- endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  {%- endif %}
+</div>
+{% endblock %}"""
+
 # Wire all templates into Flask's Jinja2 environment via DictLoader so that
 # {% extends 'base.html' %} works correctly across render_template() calls.
 app.jinja_loader = jinja2.DictLoader({
@@ -797,6 +1310,7 @@ app.jinja_loader = jinja2.DictLoader({
     "dashboard.html": DASHBOARD_PAGE,
     "users.html":     USERS_PAGE,
     "webhooks.html":  WEBHOOKS_PAGE,
+    "orders.html":    ORDERS_PAGE,
 })
 
 
@@ -918,6 +1432,28 @@ def dashboard():
 @app.route("/health")
 def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Routes — orders
+# ---------------------------------------------------------------------------
+
+@app.route("/orders")
+def orders_page():
+    redir = _require_login()
+    if redir:
+        return redir
+
+    filters = {
+        "order_source": request.args.get("order_source", ""),
+        "status":       request.args.get("status", ""),
+        "has_phone":    request.args.get("has_phone", ""),
+        "has_email":    request.args.get("has_email", ""),
+        "date_from":    request.args.get("date_from", ""),
+        "date_to":      request.args.get("date_to", ""),
+    }
+    d = get_orders_page_data(filters)
+    return _render("orders.html", active="orders", filters=filters, **d)
 
 
 # ---------------------------------------------------------------------------
