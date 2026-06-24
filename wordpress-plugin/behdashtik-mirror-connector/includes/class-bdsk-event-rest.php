@@ -207,12 +207,43 @@ class BDSK_Event_Rest {
 			}
 		}
 
+		// HPOS billing + shipping addresses
+		$addresses = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT address_type, first_name, last_name, company,
+				        address_1, address_2, city, state, postcode, country, email, phone
+				 FROM {$wpdb->prefix}wc_order_addresses
+				 WHERE order_id = %d
+				 ORDER BY address_type ASC",
+				$order_id
+			),
+			ARRAY_A
+		) ?: [];
+
+		// HPOS operational data (created_via, order_key, date_paid, date_completed, etc.)
+		$operational_data = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT created_via, woocommerce_version, prices_include_tax,
+				        order_key, date_paid_gmt, date_completed_gmt,
+				        shipping_tax_amount, shipping_total_amount,
+				        discount_tax_amount, discount_total_amount,
+				        coupon_usages_are_counted, download_permission_granted,
+				        new_order_email_sent, order_stock_reduced, recorded_sales
+				 FROM {$wpdb->prefix}wc_order_operational_data
+				 WHERE order_id = %d",
+				$order_id
+			),
+			ARRAY_A
+		) ?: [];
+
 		return new WP_REST_Response( [
-			'order_id'  => $order_id,
-			'order_row' => $order_row,
-			'meta'      => $meta,
-			'items'     => $items,
-			'exists'    => true,
+			'order_id'         => $order_id,
+			'order_row'        => $order_row,
+			'meta'             => $meta,
+			'items'            => $items,
+			'addresses'        => $addresses,
+			'operational_data' => $operational_data,
+			'exists'           => true,
 		], 200 );
 	}
 
