@@ -185,13 +185,47 @@ def main() -> None:
     finally:
         os.unlink(cnf_file)
 
-    # 8. Post-swap sanity
+    # 8. Post-swap: recalculate variable product min/max prices in lookup table.
+    # WooCommerce stores prices on variations, but the parent lookup row is only updated
+    # by WP hooks at runtime. After a raw dump/restore, parent rows may have min_price=0.
+    # Recalculate from variation lookup rows so the Hub shows correct prices.
+    import pymysql
+    db_cfg = cfg["mirror_db"]
+    rconn = pymysql.connect(
+        host=db_cfg["host"], port=db_cfg.get("port", 3306),
+        user=db_cfg["user"], password=db_cfg["password"],
+        database=mirror, charset="utf8mb4",
+    )
+    with rconn.cursor() as cur:
+        # MySQL/MariaDB won't allow correlated subqueries on the target table; use JOIN form.
+        cur.execute("""
+            UPDATE wp_wc_product_meta_lookup pl
+            JOIN wp_posts p ON p.ID = pl.product_id AND p.post_type = 'product'
+            JOIN (
+                SELECT v.post_parent AS parent_id,
+                       MIN(vl.min_price) AS new_min,
+                       MAX(vl.max_price) AS new_max
+                FROM wp_posts v
+                JOIN wp_wc_product_meta_lookup vl ON vl.product_id = v.ID
+                WHERE v.post_type = 'product_variation'
+                  AND v.post_status = 'publish'
+                  AND vl.min_price > 0
+                GROUP BY v.post_parent
+            ) AS var_prices ON var_prices.parent_id = p.ID
+            SET pl.min_price = var_prices.new_min,
+                pl.max_price = var_prices.new_max
+            WHERE pl.min_price = 0
+        """)
+        updated = cur.rowcount
+        rconn.commit()
+    rconn.close()
+    print(f"[fix] Variable product lookup recalculated: {updated} parent rows updated")
+
+    # 9. Post-swap sanity
     print()
     print("=" * 60)
     print("Post-import check")
     print("=" * 60)
-    import pymysql
-    db_cfg = cfg["mirror_db"]
     conn = pymysql.connect(
         host=db_cfg["host"], port=db_cfg.get("port", 3306),
         user=db_cfg["user"], password=db_cfg["password"],
@@ -212,6 +246,10 @@ def main() -> None:
         cur.execute("SELECT COUNT(*) cnt FROM wp_posts WHERE post_type='product' AND post_status='publish'")
         pub = cur.fetchone()
         print(f"Published products: {pub['cnt']}")
+
+        cur.execute("SELECT COUNT(*) cnt FROM wp_wc_product_meta_lookup WHERE min_price = 0 AND product_id IN (SELECT ID FROM wp_posts WHERE post_type='product' AND post_status='publish')")
+        no_price = cur.fetchone()
+        print(f"Published products with no price in lookup: {no_price['cnt']}")
     conn.close()
 
     print()

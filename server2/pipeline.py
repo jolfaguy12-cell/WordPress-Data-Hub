@@ -2313,25 +2313,24 @@ def get_status_data(cfg: dict) -> dict:
     except Exception:
         pass
 
-    # Last successful import time from meta.json files
+    # Last successful import time from meta.json files (key is import_status, use file mtime)
     last_import_at = None
     try:
-        best_ts = ""
+        best_mtime = 0.0
         for d in archive_base.iterdir():
             mp = d / "meta.json"
             if not mp.exists():
                 continue
             try:
                 m = json.loads(mp.read_text())
-                if m.get("status") == "success" and m.get("finished_at", "") > best_ts:
-                    best_ts = m["finished_at"]
+                if m.get("import_status") == "success":
+                    mt = mp.stat().st_mtime
+                    if mt > best_mtime:
+                        best_mtime = mt
             except Exception:
                 pass
-        if best_ts:
-            dt = datetime.fromisoformat(best_ts)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            last_import_at = dt.strftime("%Y-%m-%d %H:%M UTC")
+        if best_mtime:
+            last_import_at = datetime.fromtimestamp(best_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         pass
 

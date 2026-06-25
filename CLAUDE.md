@@ -21,8 +21,9 @@
 
 ## Browser / UI
 
-- **Playwright not installed** on this server. No Chromium present.
-- Use browser automation **only** when the user explicitly asks and confirms headless/server setup is acceptable.
+- **Playwright installed** (`playwright.sync_api`). Chromium at `~/.cache/ms-playwright/chromium_headless_shell-1223/`.
+- Usage: `from playwright.sync_api import sync_playwright` — launch with `args=["--no-sandbox"]`.
+- Use browser automation **only** when the user explicitly asks for UI/browser verification.
 - Prefer static code inspection; never use browser for code reading or broad exploration.
 
 ## Scope Guards
