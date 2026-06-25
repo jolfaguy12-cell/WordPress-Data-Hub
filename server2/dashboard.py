@@ -1001,7 +1001,7 @@ BASE = """\
 <meta name="viewport" content="width=device-width, initial-scale=1">
 {%- if refresh %}<meta http-equiv="refresh" content="{{ refresh }}">{%- endif %}
 <title>{% block title %}بهداشتیک هاب{% endblock %}</title>
-<style>{{ css }}</style>
+<style>{{ css | safe }}</style>
 </head>
 <body class="rtl">
 {% block nav %}
@@ -1039,7 +1039,7 @@ LOGIN_PAGE = """\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Login — Behdashtik Hub</title>
-<style>{{ css }}</style>
+<style>{{ css | safe }}</style>
 </head>
 <body>
 <div class="login-wrap">
