@@ -975,6 +975,17 @@ tr:last-child td { border-bottom: none }
 /* Scrollable table wrapper */
 .tbl-wrap { overflow-x: auto }
 
+/* Environment info bar */
+.env-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+           padding: 10px 16px; border-radius: 8px; margin-bottom: 20px;
+           font-size: .85rem; font-weight: 500 }
+.env-bar-dev  { background: #fef9c3; border: 1px solid #fde68a; color: #78350f }
+.env-bar-prod { background: #fee2e2; border: 1px solid #fca5a5; color: #7f1d1d }
+.env-badge { display: inline-block; padding: 3px 10px; border-radius: 20px;
+             font-size: .78rem; font-weight: 700; letter-spacing: .06em;
+             background: #92400e; color: #fff }
+.env-bar-prod .env-badge { background: #991b1b }
+
 @media (max-width: 600px) {
   .page { padding: 16px }
   .grid { grid-template-columns: 1fr }
@@ -1057,67 +1068,96 @@ LOGIN_PAGE = """\
 
 DASHBOARD_PAGE = """\
 {% extends 'base.html' %}
-{% block title %}Dashboard — Behdashtik Hub{% endblock %}
+{% block title %}داشبورد — بهداشتیک هاب{% endblock %}
 {% block body %}
 <div class="page">
-  <h1>System Status <span style="font-size:.75rem;font-weight:400;color:#9ca3af">
-    auto-refreshes every 60 s &nbsp;·&nbsp; {{ now }}</span></h1>
+  <h1>وضعیت سیستم <span style="font-size:.75rem;font-weight:400;color:#9ca3af">
+    بروزرسانی خودکار هر ۶۰ ثانیه &nbsp;·&nbsp; {{ now }}</span></h1>
+
+  {# Environment info bar #}
+  <div class="env-bar env-bar-{{ 'dev' if env_name == 'DEV' else 'prod' }}">
+    <span class="env-badge">{{ env_name }}</span>
+    <span>منبع: <strong>{{ wp_source }}</strong></span>
+    <span style="color:#6b7280">|</span>
+    <span>میرور: <code style="font-size:.82rem">{{ mirror_db }}</code></span>
+  </div>
+
+  {# Key counts strip #}
+  <div class="stat-strip">
+    <div class="stat-box">
+      <div class="big">{{ product_count }}</div>
+      <div class="lbl2">محصول منتشرشده</div>
+    </div>
+    <div class="stat-box">
+      <div class="big">{{ order_count }}</div>
+      <div class="lbl2">سفارش (HPOS)</div>
+    </div>
+    <div class="stat-box">
+      <div class="big">{{ media_files }}</div>
+      <div class="lbl2">فایل رسانه</div>
+    </div>
+    <div class="stat-box">
+      <div class="big">{{ pending_events }}</div>
+      <div class="lbl2">رویداد در صف</div>
+    </div>
+  </div>
+
   <div class="grid">
 
     <div class="card">
-      <h2>WordPress</h2>
-      <div class="row"><span class="lbl">Status</span><span class="val">
-        <span class="badge {{ 'badge-ok' if wp_ok else 'badge-err' }}">{{ '● OK' if wp_ok else '● Error' }}</span>
+      <h2>وردپرس</h2>
+      <div class="row"><span class="lbl">وضعیت</span><span class="val">
+        <span class="badge {{ 'badge-ok' if wp_ok else 'badge-err' }}">{{ '● خوب' if wp_ok else '● خطا' }}</span>
       </span></div>
-      <div class="row"><span class="lbl">Plugin</span><span class="val">v{{ plugin_version }}</span></div>
-      <div class="row"><span class="lbl">WordPress</span><span class="val">{{ wp_version }}</span></div>
-      <div class="row"><span class="lbl">WooCommerce</span><span class="val">{{ wc_version }}</span></div>
+      <div class="row"><span class="lbl">افزونه</span><span class="val">v{{ plugin_version }}</span></div>
+      <div class="row"><span class="lbl">وردپرس</span><span class="val">{{ wp_version }}</span></div>
+      <div class="row"><span class="lbl">ووکامرس</span><span class="val">{{ wc_version }}</span></div>
       <div class="row"><span class="lbl">PHP</span><span class="val">{{ php_version }}</span></div>
-      <div class="row"><span class="lbl">Connector</span><span class="val">
+      <div class="row"><span class="lbl">کانکتور</span><span class="val">
         <span class="badge {{ 'badge-ok' if connector_enabled else 'badge-err' }}">
-          {{ 'enabled' if connector_enabled else 'DISABLED' }}</span>
+          {{ 'فعال' if connector_enabled else 'غیرفعال' }}</span>
       </span></div>
-      <div class="row"><span class="lbl">Connection</span><span class="val">
+      <div class="row"><span class="lbl">اتصال</span><span class="val">
         <span class="badge {{ conn_cls }}">{{ conn_status }}</span>
       </span></div>
-      <div class="row"><span class="lbl">Last request</span><span class="val">{{ last_req or '—' }}</span></div>
-      <div class="row"><span class="lbl">Last cleanup</span><span class="val">{{ last_cleanup or '—' }}</span></div>
+      <div class="row"><span class="lbl">آخرین درخواست</span><span class="val">{{ last_req or '—' }}</span></div>
     </div>
 
     <div class="card">
-      <h2>DB Mirror</h2>
+      <h2>میرور دیتابیس</h2>
+      <div class="row"><span class="lbl">آخرین ایمپورت</span><span class="val">{{ last_import_at or '—' }}</span></div>
+      <div class="row"><span class="lbl">آرشیو روی دیسک</span><span class="val">{{ archive_count }}</span></div>
       {% if job %}
-      <div class="row"><span class="lbl">Job</span><span class="val">{{ job.job_id[:8] }}…</span></div>
-      <div class="row"><span class="lbl">Status</span><span class="val">
-        <span class="badge {{ 'badge-ok' if job.status in ('done','completed','downloaded') else ('badge-warn' if job.status in ('running','pending') else 'badge-err') }}">
+      <div class="row"><span class="lbl">آخرین جاب</span><span class="val">{{ job.job_id }}</span></div>
+      <div class="row"><span class="lbl">وضعیت جاب</span><span class="val">
+        <span class="badge {{ 'badge-ok' if job.status in ('done','completed','downloaded','success') else ('badge-warn' if job.status in ('running','pending') else 'badge-err') }}">
           {{ job.status }}</span></span></div>
-      <div class="row"><span class="lbl">Created</span><span class="val">{{ job.created_at or '—' }}</span></div>
-      <div class="row"><span class="lbl">Finished</span><span class="val">{{ job.finished_at or '—' }}</span></div>
+      <div class="row"><span class="lbl">ساخته‌شده</span><span class="val">{{ job.created_at or '—' }}</span></div>
+      <div class="row"><span class="lbl">تمام‌شده</span><span class="val">{{ job.finished_at or '—' }}</span></div>
       {% else %}
-      <div class="row"><span class="lbl">Status</span><span class="val">No jobs</span></div>
+      <div class="row"><span class="lbl">وضعیت</span><span class="val"><span class="badge badge-warn">بدون جاب</span></span></div>
       {% endif %}
-      <div class="row"><span class="lbl">Archives on disk</span><span class="val">{{ archive_count }}</span></div>
     </div>
 
     <div class="card">
-      <h2>Media</h2>
-      <div class="row"><span class="lbl">Index</span><span class="val">{{ media_index_status }}</span></div>
+      <h2>رسانه</h2>
+      <div class="row"><span class="lbl">وضعیت ایندکس</span><span class="val">{{ media_index_status }}</span></div>
       {% if mc %}
-      <div class="row"><span class="lbl">Downloaded</span><span class="val">{{ mc.get('downloaded',0) + mc.get('active',0) }}</span></div>
-      <div class="row"><span class="lbl">Pending</span><span class="val">{{ mc.get('pending',0) + mc.get('queued',0) }}</span></div>
-      <div class="row"><span class="lbl">Failed</span><span class="val">{{ mc.get('failed',0) }}</span></div>
+      <div class="row"><span class="lbl">دانلودشده</span><span class="val">{{ mc.get('downloaded',0) + mc.get('active',0) }}</span></div>
+      <div class="row"><span class="lbl">در صف</span><span class="val">{{ mc.get('pending',0) + mc.get('queued',0) }}</span></div>
+      <div class="row"><span class="lbl">خطا</span><span class="val">{{ mc.get('failed',0) }}</span></div>
       {% endif %}
-      <div class="row"><span class="lbl">Files on disk</span><span class="val">{{ media_files }}</span></div>
-      <div class="row"><span class="lbl">Last sync</span><span class="val">{{ last_sync_at or '—' }}</span></div>
+      <div class="row"><span class="lbl">فایل روی دیسک</span><span class="val">{{ media_files }}</span></div>
+      <div class="row"><span class="lbl">آخرین همگام‌سازی</span><span class="val">{{ last_sync_at or '—' }}</span></div>
     </div>
 
     <div class="card">
-      <h2>Event Outbox</h2>
+      <h2>صف رویدادها</h2>
       <div class="num">{{ pending_events }}</div>
-      <div class="sub">Pending on WordPress</div>
+      <div class="sub">رویداد در انتظار روی وردپرس</div>
       <br>
-      <div class="row"><span class="lbl">Cursor</span><span class="val">after_id={{ event_after_id }}</span></div>
-      <div class="row"><span class="lbl">Last sync</span><span class="val">{{ event_last_run or 'never' }}</span></div>
+      <div class="row"><span class="lbl">کرسر</span><span class="val">after_id={{ event_after_id }}</span></div>
+      <div class="row"><span class="lbl">آخرین همگام‌سازی</span><span class="val">{{ event_last_run or 'هرگز' }}</span></div>
     </div>
 
   </div>
@@ -1806,6 +1846,9 @@ def dashboard():
         return redir
 
     cfg = load_config()
+    env_name   = cfg.get("env", "?").upper()
+    wp_source  = cfg.get("wp_base_url", "?")
+    mirror_db  = cfg["mirror_db"]["name"]
     try:
         d = get_status_data(cfg)
     except Exception as exc:
@@ -1816,7 +1859,9 @@ def dashboard():
                        conn_status="error", last_req=str(exc), last_cleanup=None,
                        job=None, archive_count=0, media_index_status="?",
                        mc={}, media_files=0, last_sync_at=None,
-                       pending_events="?", event_after_id=0, event_last_run=None)
+                       pending_events="?", event_after_id=0, event_last_run=None,
+                       env_name=env_name, wp_source=wp_source, mirror_db=mirror_db,
+                       product_count=0, order_count=0, last_import_at=None)
 
     h   = d.get("health", {})
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -1856,7 +1901,11 @@ def dashboard():
                    last_sync_at=d.get("last_sync_at"),
                    pending_events=h.get("event_outbox_pending_count", 0),
                    event_after_id=d.get("event_after_id", 0),
-                   event_last_run=d.get("event_last_run"))
+                   event_last_run=d.get("event_last_run"),
+                   env_name=env_name, wp_source=wp_source, mirror_db=mirror_db,
+                   product_count=d.get("product_count", 0),
+                   order_count=d.get("order_count", 0),
+                   last_import_at=d.get("last_import_at"))
 
 
 @app.route("/health")

@@ -2301,16 +2301,53 @@ def get_status_data(cfg: dict) -> dict:
         if last_sync_ts else "never"
     )
 
+    # Mirror DB: product + order counts
+    product_count = order_count = 0
+    try:
+        with _mirror_conn(cfg) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM wp_posts WHERE post_type='product' AND post_status='publish'")
+                product_count = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM wp_wc_orders")
+                order_count = cur.fetchone()[0]
+    except Exception:
+        pass
+
+    # Last successful import time from meta.json files
+    last_import_at = None
+    try:
+        best_ts = ""
+        for d in archive_base.iterdir():
+            mp = d / "meta.json"
+            if not mp.exists():
+                continue
+            try:
+                m = json.loads(mp.read_text())
+                if m.get("status") == "success" and m.get("finished_at", "") > best_ts:
+                    best_ts = m["finished_at"]
+            except Exception:
+                pass
+        if best_ts:
+            dt = datetime.fromisoformat(best_ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            last_import_at = dt.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        pass
+
     return {
-        "health":         health,
-        "latest_job":     latest_job,
-        "media_counts":   media_counts,
-        "media_files":    media_files,
-        "archive_count":  archive_count,
-        "archive_base":   str(archive_base),
-        "last_sync_at":   last_sync_str,
-        "event_after_id": event_state.get("after_id", 0),
-        "event_last_run": event_state_mtime,
+        "health":          health,
+        "latest_job":      latest_job,
+        "media_counts":    media_counts,
+        "media_files":     media_files,
+        "archive_count":   archive_count,
+        "archive_base":    str(archive_base),
+        "last_sync_at":    last_sync_str,
+        "event_after_id":  event_state.get("after_id", 0),
+        "event_last_run":  event_state_mtime,
+        "product_count":   product_count,
+        "order_count":     order_count,
+        "last_import_at":  last_import_at,
     }
 
 
