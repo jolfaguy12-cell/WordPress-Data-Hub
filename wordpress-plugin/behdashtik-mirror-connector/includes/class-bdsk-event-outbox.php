@@ -36,6 +36,10 @@ class BDSK_Event_Outbox {
 		add_action( 'created_term', [ __CLASS__, 'handle_term_changed' ], 10, 3 );
 		add_action( 'edited_term',  [ __CLASS__, 'handle_term_changed' ], 10, 3 );
 		add_action( 'delete_term',  [ __CLASS__, 'handle_term_deleted' ], 10, 3 );
+
+		// Attachment hooks
+		add_action( 'add_attachment',  [ __CLASS__, 'handle_attachment_upserted' ] );
+		add_action( 'edit_attachment', [ __CLASS__, 'handle_attachment_upserted' ] );
 	}
 
 	// ---------------------------------------------------------------------------
@@ -163,9 +167,21 @@ class BDSK_Event_Outbox {
 
 	// before_delete_post fires before permanent deletion for all post types
 	public static function handle_post_before_delete( int $post_id ): void {
-		if ( 'product' === get_post_type( $post_id ) ) {
+		$type = get_post_type( $post_id );
+		if ( 'product' === $type ) {
 			self::enqueue( 'product', $post_id, 'deleted' );
+		} elseif ( 'attachment' === $type ) {
+			self::enqueue( 'attachment', $post_id, 'deleted' );
 		}
+	}
+
+	// ---------------------------------------------------------------------------
+	// Attachment hook handlers
+	// ---------------------------------------------------------------------------
+
+	// add_attachment / edit_attachment: ($attachment_id)
+	public static function handle_attachment_upserted( int $attachment_id ): void {
+		self::enqueue( 'attachment', $attachment_id, 'upserted' );
 	}
 
 	// ---------------------------------------------------------------------------

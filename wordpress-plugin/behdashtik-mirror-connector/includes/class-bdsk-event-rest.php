@@ -77,6 +77,19 @@ class BDSK_Event_Rest {
 				],
 			],
 		] );
+
+		register_rest_route( self::NAMESPACE, '/snapshot/attachment/(?P<attachment_id>\d+)', [
+			'methods'             => 'GET',
+			'callback'            => [ __CLASS__, 'handle_attachment_snapshot' ],
+			'permission_callback' => '__return_true',
+			'args'                => [
+				'attachment_id' => [
+					'type'              => 'integer',
+					'minimum'           => 1,
+					'sanitize_callback' => 'absint',
+				],
+			],
+		] );
 	}
 
 	// ---------------------------------------------------------------------------
@@ -443,6 +456,50 @@ class BDSK_Event_Rest {
 			'term_row'   => $term_row,
 			'taxonomies' => $taxonomies,
 			'termmeta'   => $termmeta,
+		], 200 );
+	}
+
+	// ---------------------------------------------------------------------------
+	// GET /snapshot/attachment/{attachment_id}
+	// ---------------------------------------------------------------------------
+
+	public static function handle_attachment_snapshot( WP_REST_Request $request ): WP_REST_Response|WP_Error {
+		$auth = BDSK_Security::validate_request( $request );
+		if ( is_wp_error( $auth ) ) {
+			return $auth;
+		}
+		if ( ! BDSK_Settings::get( 'event_sync_enabled', true ) ) {
+			return new WP_Error( 'event_sync_disabled', 'Event sync is disabled.', [ 'status' => 403 ] );
+		}
+
+		global $wpdb;
+		$attachment_id = (int) $request->get_param( 'attachment_id' );
+
+		$post_row = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT * FROM {$wpdb->posts} WHERE ID = %d AND post_type = 'attachment'",
+				$attachment_id
+			),
+			ARRAY_A
+		);
+
+		if ( null === $post_row ) {
+			return new WP_REST_Response( [ 'exists' => false ], 404 );
+		}
+
+		$meta = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT meta_key, meta_value FROM {$wpdb->postmeta} WHERE post_id = %d ORDER BY meta_id ASC",
+				$attachment_id
+			),
+			ARRAY_A
+		) ?: [];
+
+		return new WP_REST_Response( [
+			'exists'        => true,
+			'attachment_id' => $attachment_id,
+			'post_row'      => $post_row,
+			'meta'          => $meta,
 		], 200 );
 	}
 }
