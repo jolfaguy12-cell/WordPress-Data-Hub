@@ -1648,6 +1648,43 @@ def _apply_product_delete(cur, product_id: int) -> None:
     cur.execute(f"DELETE FROM {prefix}posts WHERE ID = %s", (product_id,))
 
 
+def _apply_attachment_upsert(cur, snap: dict) -> None:
+    prefix        = _WP_PREFIX
+    attachment_id = int(snap["attachment_id"])
+    post_row      = snap["post_row"]
+
+    cols    = list(post_row.keys())
+    vals    = [post_row[c] for c in cols]
+    col_sql = ", ".join(f"`{c}`" for c in cols)
+    ph_sql  = ", ".join(["%s"] * len(cols))
+    upd_sql = ", ".join(f"`{c}` = VALUES(`{c}`)" for c in cols if c != "ID")
+    cur.execute(
+        f"INSERT INTO {prefix}posts ({col_sql}) VALUES ({ph_sql}) "
+        f"ON DUPLICATE KEY UPDATE {upd_sql}",
+        vals,
+    )
+
+    cur.execute(f"DELETE FROM {prefix}postmeta WHERE post_id = %s", (attachment_id,))
+    if snap.get("meta"):
+        m_ph   = ", ".join(["(%s, %s, %s)"] * len(snap["meta"]))
+        m_vals = []
+        for m in snap["meta"]:
+            m_vals.extend([attachment_id, m["meta_key"], m["meta_value"]])
+        cur.execute(
+            f"INSERT INTO {prefix}postmeta (post_id, meta_key, meta_value) VALUES {m_ph}",
+            m_vals,
+        )
+
+
+def _apply_attachment_delete(cur, attachment_id: int) -> None:
+    prefix = _WP_PREFIX
+    cur.execute(f"DELETE FROM {prefix}postmeta WHERE post_id = %s", (attachment_id,))
+    cur.execute(
+        f"DELETE FROM {prefix}posts WHERE ID = %s AND post_type = 'attachment'",
+        (attachment_id,),
+    )
+
+
 def _apply_product_upsert(cfg, cur, snapshot: dict) -> None:
     prefix = _WP_PREFIX
     product_id = int(snapshot["product_id"])
@@ -2162,6 +2199,8 @@ def run_event_sync(cfg: dict) -> None:
                             _apply_order_delete(cur, entity_id)
                         elif entity_type == "term":
                             _apply_term_delete(cur, entity_id)
+                        elif entity_type == "attachment":
+                            _apply_attachment_delete(cur, entity_id)
                         else:
                             _apply_product_delete(cur, entity_id)
                     else:
@@ -2174,6 +2213,8 @@ def run_event_sync(cfg: dict) -> None:
                                 _apply_order_delete(cur, entity_id)
                             elif entity_type == "term":
                                 _apply_term_delete(cur, entity_id)
+                            elif entity_type == "attachment":
+                                _apply_attachment_delete(cur, entity_id)
                             else:
                                 _apply_product_delete(cur, entity_id)
                         else:
@@ -2182,6 +2223,8 @@ def run_event_sync(cfg: dict) -> None:
                                 _apply_order_upsert(cur, snap)
                             elif entity_type == "term":
                                 _apply_term_upsert(cur, snap)
+                            elif entity_type == "attachment":
+                                _apply_attachment_upsert(cur, snap)
                             else:
                                 _apply_product_upsert(cfg, cur, snap)
 
