@@ -2198,6 +2198,6 @@ if __name__ == "__main__":
         _hub = load_config().get("hub", {})
         app.run(
             host=_hub.get("host", "127.0.0.1"),
-            port=int(_hub.get("port", 8089)),
+            port=int(_hub.get("port", 8090)),
             debug=False,
         )
