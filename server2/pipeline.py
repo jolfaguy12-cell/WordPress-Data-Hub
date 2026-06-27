@@ -55,7 +55,10 @@ def api_get(cfg: dict, path: str, params: dict | None = None) -> dict:
     try:
         resp = requests.get(
             url,
-            headers={"Authorization": f"Bearer {cfg['api_secret']}"},
+            headers={
+                "Authorization": f"Bearer {cfg['api_secret']}",
+                "Accept-Encoding": "gzip, deflate",  # brotli causes decode errors via Cloudflare
+            },
             params=params,
             timeout=cfg.get("request_timeout_seconds", 60),
         )
